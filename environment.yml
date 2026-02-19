@@ -1,0 +1,32 @@
+name: ngs-sample-qc-lims
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  
+  # Qt dependencies via conda (prevents DLL issues)
+  - pyqt=5.15.9
+  
+  # Data Processing (via conda for better compatibility)
+  - pandas=2.1.4
+  - numpy=1.26.3
+  - matplotlib=3.8.2
+  - lxml=5.1.0
+  
+  # Database
+  - sqlalchemy=2.0.25
+  
+  # Pip packages
+  - pip
+  - pip:
+      # Additional packages not in conda
+      - alembic==1.13.1
+      - openpyxl==3.1.2
+      - xlrd==2.0.1
+      - plotly==5.18.0
+      - kaleido==0.2.1
+      - python-dateutil==2.8.2
+      - reportlab==4.0.8
+      - tqdm==4.66.1
+      - colorama==0.4.6
