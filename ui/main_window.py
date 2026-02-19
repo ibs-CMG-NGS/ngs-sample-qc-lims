@@ -13,6 +13,7 @@ import logging
 
 from config.settings import WINDOW_TITLE, WINDOW_WIDTH, WINDOW_HEIGHT
 from database import db_manager
+from ui.sample_tab import SampleTab
 
 logger = logging.getLogger(__name__)
 
@@ -66,11 +67,8 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(dashboard_tab, "📊 Dashboard")
         
         # Sample Management 탭
-        sample_tab = QWidget()
-        sample_layout = QVBoxLayout()
-        sample_layout.addWidget(QLabel("Sample Management - Coming Soon"))
-        sample_tab.setLayout(sample_layout)
-        self.tabs.addTab(sample_tab, "🧬 Samples")
+        self.sample_tab = SampleTab()
+        self.tabs.addTab(self.sample_tab, "🧬 Samples")
         
         # Data Upload 탭
         upload_tab = QWidget()
@@ -175,9 +173,8 @@ class MainWindow(QMainWindow):
     
     def new_sample(self):
         """새 샘플 등록"""
-        # TODO: 샘플 등록 다이얼로그 구현
-        self.statusBar().showMessage('New Sample - Not implemented yet')
-        logger.info("New sample action triggered")
+        self.tabs.setCurrentWidget(self.sample_tab)
+        self.sample_tab.open_new_sample_dialog()
     
     def open_settings(self):
         """설정 열기"""
@@ -186,7 +183,7 @@ class MainWindow(QMainWindow):
     def refresh_data(self):
         """데이터 새로고침"""
         self.statusBar().showMessage('Refreshing data...')
-        # TODO: 데이터 새로고침 로직 구현
+        self.sample_tab.refresh_samples()
         self.statusBar().showMessage('Data refreshed', 3000)
     
     def open_molarity_calculator(self):

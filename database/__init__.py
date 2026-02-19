@@ -9,13 +9,18 @@ from database.db_manager import (
     add_qc_metric,
     get_qc_metrics_by_sample,
     get_latest_qc_metric,
-    add_raw_trace
+    add_raw_trace,
+    update_sample,
+    delete_sample,
+    get_qc_metric_by_id,
+    update_qc_metric,
+    delete_qc_metric
 )
 
 __all__ = [
     'Base',
     'Sample',
-    'QCMetric', 
+    'QCMetric',
     'RawTrace',
     'ExperimentBatch',
     'DatabaseManager',
@@ -23,8 +28,13 @@ __all__ = [
     'add_sample',
     'get_sample_by_id',
     'get_all_samples',
+    'update_sample',
+    'delete_sample',
     'add_qc_metric',
     'get_qc_metrics_by_sample',
     'get_latest_qc_metric',
-    'add_raw_trace'
+    'add_raw_trace',
+    'get_qc_metric_by_id',
+    'update_qc_metric',
+    'delete_qc_metric'
 ]

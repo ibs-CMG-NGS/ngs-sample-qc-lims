@@ -119,6 +119,17 @@ def get_sample_by_id(session, sample_id):
     return session.query(Sample).filter(Sample.sample_id == sample_id).first()
 
 
+def delete_sample(session, sample_id):
+    """샘플 및 관련 QC 데이터/Raw Trace 삭제"""
+    from database.models import Sample, QCMetric, RawTrace
+
+    session.query(RawTrace).filter(RawTrace.sample_id == sample_id).delete()
+    session.query(QCMetric).filter(QCMetric.sample_id == sample_id).delete()
+    count = session.query(Sample).filter(Sample.sample_id == sample_id).delete()
+    session.flush()
+    return count > 0
+
+
 def get_all_samples(session, sample_type=None):
     """모든 샘플 조회 (타입 필터 옵션)"""
     from database.models import Sample
@@ -157,6 +168,46 @@ def get_latest_qc_metric(session, sample_id, step=None):
     if step:
         query = query.filter(QCMetric.step == step)
     return query.order_by(QCMetric.measured_at.desc()).first()
+
+
+def get_qc_metric_by_id(session, metric_id):
+    """QC 측정값 PK로 조회"""
+    from database.models import QCMetric
+    return session.query(QCMetric).filter(QCMetric.id == metric_id).first()
+
+
+def update_qc_metric(session, metric_id, update_data):
+    """QC 측정값 수정"""
+    metric = get_qc_metric_by_id(session, metric_id)
+    if not metric:
+        return None
+    for key, value in update_data.items():
+        if hasattr(metric, key):
+            setattr(metric, key, value)
+    session.flush()
+    return metric
+
+
+def delete_qc_metric(session, metric_id):
+    """QC 측정값 삭제"""
+    metric = get_qc_metric_by_id(session, metric_id)
+    if not metric:
+        return False
+    session.delete(metric)
+    session.flush()
+    return True
+
+
+def update_sample(session, sample_id, update_data):
+    """샘플 정보 수정"""
+    sample = get_sample_by_id(session, sample_id)
+    if not sample:
+        return None
+    for key, value in update_data.items():
+        if hasattr(sample, key):
+            setattr(sample, key, value)
+    session.flush()
+    return sample
 
 
 def add_raw_trace(session, trace_data):
