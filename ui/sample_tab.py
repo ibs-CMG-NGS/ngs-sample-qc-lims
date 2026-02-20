@@ -29,7 +29,7 @@ from analysis.visualizer import load_electropherogram_traces, qc_visualizer
 logger = logging.getLogger(__name__)
 
 # Sample list columns
-SAMPLE_COLS = ["Sample ID", "Name", "Type", "Source", "Latest Status", "Created"]
+SAMPLE_COLS = ["Sample ID", "Name", "Species", "Material", "Type", "Created"]
 
 # QC detail columns
 QC_COLS = [
@@ -176,25 +176,21 @@ class SampleTab(QWidget):
                         row, 1, QTableWidgetItem(s.sample_name or "")
                     )
                     self.sample_table.setItem(
-                        row, 2, QTableWidgetItem(s.sample_type or "")
+                        row, 2, QTableWidgetItem(
+                            getattr(s, 'species', None) or ""
+                        )
                     )
                     self.sample_table.setItem(
-                        row, 3, QTableWidgetItem(s.source or "")
+                        row, 3, QTableWidgetItem(
+                            getattr(s, 'material', None) or ""
+                        )
                     )
-
-                    latest = get_latest_qc_metric(session, s.sample_id)
-                    status_text = (
-                        latest.status if latest and latest.status else "No data"
+                    self.sample_table.setItem(
+                        row, 4, QTableWidgetItem(s.sample_type or "")
                     )
-                    status_item = QTableWidgetItem(status_text)
-                    color = STATUS_COLORS.get(status_text)
-                    if color:
-                        from PyQt5.QtGui import QColor
-                        status_item.setForeground(QColor(color))
-                    self.sample_table.setItem(row, 4, status_item)
 
                     created = (
-                        s.created_at.strftime("%Y-%m-%d %H:%M")
+                        s.created_at.strftime("%Y-%m-%d")
                         if s.created_at
                         else "-"
                     )

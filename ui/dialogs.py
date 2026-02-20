@@ -13,7 +13,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QDate
 import logging
 
-from config.settings import SAMPLE_TYPES, QC_STEPS
+from config.settings import SAMPLE_TYPES, QC_STEPS, SPECIES_LIST, MATERIAL_LIST
 from database import (
     db_manager, add_sample, get_sample_by_id, update_sample,
     add_qc_metric, get_qc_metrics_by_sample, add_raw_trace,
@@ -59,15 +59,30 @@ class SampleDialog(QDialog):
         form.addRow("Sample ID:", self.sample_id_edit)
 
         self.sample_name_edit = QLineEdit()
+        self.sample_name_edit.setPlaceholderText("Optional (memo / alias)")
         form.addRow("Sample Name:", self.sample_name_edit)
+
+        self.species_combo = QComboBox()
+        self.species_combo.setEditable(True)
+        for sp in SPECIES_LIST:
+            self.species_combo.addItem(sp)
+        self.species_combo.addItem("Other")
+        self.species_combo.setCurrentIndex(-1)
+        self.species_combo.setPlaceholderText("Select or type...")  # Qt 5.15+
+        form.addRow("Species:", self.species_combo)
+
+        self.material_combo = QComboBox()
+        self.material_combo.setEditable(True)
+        for mt in MATERIAL_LIST:
+            self.material_combo.addItem(mt)
+        self.material_combo.setCurrentIndex(-1)
+        self.material_combo.setPlaceholderText("Select or type...")
+        form.addRow("Material:", self.material_combo)
 
         self.type_combo = QComboBox()
         for key, desc in SAMPLE_TYPES.items():
             self.type_combo.addItem(f"{key} ({desc})", key)
         form.addRow("Sample Type:", self.type_combo)
-
-        self.source_edit = QLineEdit()
-        form.addRow("Source:", self.source_edit)
 
         self.desc_edit = QTextEdit()
         self.desc_edit.setMaximumHeight(80)
@@ -90,11 +105,13 @@ class SampleDialog(QDialog):
                 self.sample_id_edit.setText(sample.sample_id)
                 self.sample_id_edit.setReadOnly(True)
                 self.sample_name_edit.setText(sample.sample_name or "")
-                # type combo
+                if sample.species:
+                    self.species_combo.setCurrentText(sample.species)
+                if sample.material:
+                    self.material_combo.setCurrentText(sample.material)
                 idx = self.type_combo.findData(sample.sample_type)
                 if idx >= 0:
                     self.type_combo.setCurrentIndex(idx)
-                self.source_edit.setText(sample.source or "")
                 self.desc_edit.setPlainText(sample.description or "")
         except Exception as e:
             logger.error(f"Failed to load sample: {e}")
@@ -105,10 +122,14 @@ class SampleDialog(QDialog):
             QMessageBox.warning(self, "Validation", "Sample ID is required.")
             return
 
+        species_text = self.species_combo.currentText().strip()
+        material_text = self.material_combo.currentText().strip()
+
         data = {
             "sample_name": self.sample_name_edit.text().strip() or None,
+            "species": species_text or None,
+            "material": material_text or None,
             "sample_type": self.type_combo.currentData(),
-            "source": self.source_edit.text().strip() or None,
             "description": self.desc_edit.toPlainText().strip() or None,
         }
 

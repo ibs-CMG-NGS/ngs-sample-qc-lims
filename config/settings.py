@@ -31,6 +31,12 @@ SAMPLE_TYPES = {
     "ATAC-seq": "ATAC Sequencing"
 }
 
+# Species
+SPECIES_LIST = ["Human", "Mouse", "Rat"]
+
+# Sample Material
+MATERIAL_LIST = ["Blood", "Tissue", "Cultured Cell", "FFPE", "Saliva"]
+
 # QC Steps
 QC_STEPS = [
     "gDNA Extraction",

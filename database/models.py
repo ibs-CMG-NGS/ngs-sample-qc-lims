@@ -34,6 +34,8 @@ class Sample(Base):
     sample_id = Column(String(100), unique=True, nullable=False, index=True)
     sample_name = Column(String(200))
     sample_type = Column(String(50), nullable=False)  # WGS, mRNA-seq, etc.
+    species = Column(String(100))  # Human, Mouse, Rat, etc.
+    material = Column(String(100))  # Blood, Tissue, Cultured Cell, FFPE, Saliva
     source = Column(String(200))
     description = Column(String(500))
     created_at = Column(DateTime, default=datetime.now)
