@@ -10,6 +10,8 @@ from typing import List, Dict, Optional
 import logging
 
 from config.settings import STATUS_COLORS, CHART_DPI, CHART_FIGSIZE
+from database import db_manager, get_qc_metrics_by_sample
+from database.models import RawTrace
 
 logger = logging.getLogger(__name__)
 
@@ -209,8 +211,167 @@ class QCVisualizer:
         if save_path:
             plt.savefig(save_path, dpi=self.dpi, bbox_inches='tight')
             logger.info(f"Batch comparison saved: {save_path}")
-        
+
         return fig
+
+    def plot_electropherogram_overlay(
+        self,
+        sample_id: str,
+        traces: List[Dict],
+        ladder_points: Optional[List[float]] = None,
+        save_path: Optional[str] = None,
+    ) -> Optional[plt.Figure]:
+        """Electropherogram step-overlay for a single sample.
+
+        Args:
+            sample_id: Sample ID
+            traces: [{'step': str, 'size_bp': ndarray, 'rfu': ndarray}, ...]
+            ladder_points: Ladder Size(bp) values from Size Calibration for x-ticks
+            save_path: Optional save path
+
+        Returns:
+            matplotlib Figure or None
+        """
+        if not traces:
+            logger.warning(f"No electropherogram traces for {sample_id}")
+            return None
+
+        fig, ax = plt.subplots(figsize=self.figsize, dpi=self.dpi)
+
+        colors = plt.cm.tab10(np.linspace(0, 1, max(len(traces), 1)))
+
+        for i, trace in enumerate(traces):
+            step = trace.get('step', f'Step {i + 1}')
+            size_bp = trace.get('size_bp', [])
+            rfu = trace.get('rfu', [])
+
+            if len(size_bp) > 0 and len(rfu) > 0:
+                ax.plot(size_bp, rfu, label=step, color=colors[i], linewidth=1.5)
+
+        ax.set_xscale('log')
+
+        # Ladder points as x-axis ticks
+        if ladder_points:
+            from matplotlib.ticker import FixedLocator, FixedFormatter
+            ticks = sorted([p for p in ladder_points if p > 0])
+            ax.xaxis.set_major_locator(FixedLocator(ticks))
+            labels = []
+            for v in ticks:
+                if v >= 1000:
+                    labels.append(f'{int(v):,}')
+                else:
+                    labels.append(str(int(v)))
+            ax.xaxis.set_major_formatter(FixedFormatter(labels))
+            ax.xaxis.set_minor_locator(FixedLocator([]))  # no minor ticks
+            ax.tick_params(axis='x', rotation=45, labelsize=9)
+            # Set x-range to ladder extent with some margin
+            ax.set_xlim(min(ticks) * 0.5, max(ticks) * 2.5)
+
+        ax.set_xlabel('Size (bp)', fontsize=12, fontweight='bold')
+        ax.set_ylabel('RFU', fontsize=12, fontweight='bold')
+        ax.set_title(f'Electropherogram: {sample_id}', fontsize=14, fontweight='bold')
+        ax.legend(loc='best')
+        ax.grid(alpha=0.3, which='major')
+
+        plt.tight_layout()
+
+        if save_path:
+            plt.savefig(save_path, dpi=self.dpi, bbox_inches='tight')
+            logger.info(f"Electropherogram overlay saved: {save_path}")
+
+        return fig
+
+
+def load_electropherogram_traces(sample_id: str) -> tuple:
+    """Load electropherogram traces for a sample from DB + on-demand CSV parsing.
+
+    Returns:
+        (traces, ladder_points) where
+        traces: [{'step': str, 'size_bp': ndarray, 'rfu': ndarray}, ...]
+        ladder_points: [float, ...] from Size Calibration or empty list
+    """
+    from parsers import parse_electropherogram, parse_size_calibration
+    from database.models import FemtoPulseRun
+
+    traces = []
+    ladder_points = []
+    try:
+        with db_manager.session_scope() as session:
+            raw_traces = (
+                session.query(RawTrace)
+                .filter(
+                    RawTrace.sample_id == sample_id,
+                    RawTrace.instrument_name == 'Femto Pulse',
+                    RawTrace.assay_type == 'Electropherogram',
+                )
+                .order_by(RawTrace.created_at)
+                .all()
+            )
+
+            for rt in raw_traces:
+                if not rt.raw_file_path:
+                    continue
+                from pathlib import Path
+                if not Path(rt.raw_file_path).exists():
+                    logger.warning(f"Electropherogram file not found: {rt.raw_file_path}")
+                    continue
+
+                # Load ladder points from the FemtoPulseRun that owns this electropherogram
+                if not ladder_points:
+                    fp_run = (
+                        session.query(FemtoPulseRun)
+                        .filter(FemtoPulseRun.electropherogram_path == rt.raw_file_path)
+                        .first()
+                    )
+                    if fp_run and fp_run.size_calibration_path:
+                        cal_path = fp_run.size_calibration_path
+                        if Path(cal_path).exists():
+                            try:
+                                cal_data = parse_size_calibration(cal_path)
+                                ladder_points = [
+                                    r['ladder_size_bp'] for r in cal_data
+                                    if r.get('ladder_size_bp') is not None
+                                ]
+                            except Exception as e:
+                                logger.warning(f"Failed to parse size calibration: {e}")
+
+                try:
+                    data = parse_electropherogram(rt.raw_file_path)
+                    size_bp = data['size_bp']
+
+                    # image_path stores the original file sample ID (e.g. "SampB1")
+                    # that maps to this DB sample_id (e.g. "6238")
+                    file_sid = rt.image_path  # 원본 파일 Sample ID
+                    matched_rfu = None
+                    for col_name, rfu_arr in data['samples'].items():
+                        # 1차: 원본 파일 Sample ID로 매칭 (가장 정확)
+                        if file_sid and file_sid in col_name:
+                            matched_rfu = rfu_arr
+                            break
+                    if matched_rfu is None:
+                        for col_name, rfu_arr in data['samples'].items():
+                            # 2차 fallback: DB sample_id로 매칭
+                            if sample_id in col_name:
+                                matched_rfu = rfu_arr
+                                break
+                            # 3차 fallback: Samp + DB sample_id
+                            if f'Samp{sample_id}' in col_name:
+                                matched_rfu = rfu_arr
+                                break
+
+                    if matched_rfu is not None:
+                        traces.append({
+                            'step': rt.step or 'Unknown',
+                            'size_bp': size_bp,
+                            'rfu': matched_rfu,
+                        })
+                except Exception as e:
+                    logger.warning(f"Failed to parse electropherogram {rt.raw_file_path}: {e}")
+
+    except Exception as e:
+        logger.error(f"Failed to load electropherogram traces: {e}")
+
+    return traces, ladder_points
 
 
 # 전역 인스턴스
@@ -231,3 +392,13 @@ def create_sizing_overlay(sample_id: str, traces: List[Dict], save_path: str = N
 def create_batch_comparison(samples: List[Dict], metric: str = 'gqn_rin', save_path: str = None):
     """Batch comparison 생성 헬퍼 함수"""
     return qc_visualizer.plot_batch_comparison(samples, metric, save_path)
+
+
+def create_electropherogram_overlay(sample_id: str, traces: List[Dict] = None,
+                                    ladder_points: List[float] = None, save_path: str = None):
+    """Electropherogram overlay 생성 헬퍼 함수"""
+    if traces is None:
+        traces, ladder_points = load_electropherogram_traces(sample_id)
+    return qc_visualizer.plot_electropherogram_overlay(
+        sample_id, traces, ladder_points=ladder_points, save_path=save_path
+    )

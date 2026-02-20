@@ -70,13 +70,6 @@ class MainWindow(QMainWindow):
         self.sample_tab = SampleTab()
         self.tabs.addTab(self.sample_tab, "🧬 Samples")
         
-        # Data Upload 탭
-        upload_tab = QWidget()
-        upload_layout = QVBoxLayout()
-        upload_layout.addWidget(QLabel("Data Upload - Coming Soon"))
-        upload_tab.setLayout(upload_layout)
-        self.tabs.addTab(upload_tab, "📤 Upload")
-        
         # QC Analysis 탭
         analysis_tab = QWidget()
         analysis_layout = QVBoxLayout()

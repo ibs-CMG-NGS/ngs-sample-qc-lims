@@ -1,253 +1,577 @@
 """
-Femto Pulse 데이터 파서
-Femto Pulse의 CSV/XML 출력 파일에서 GQN, Peak Size, Sizing 데이터 추출
+Femto Pulse 5-file parser + folder scanner
+
+Femto Pulse generates 5 CSV files per run:
+  - Quality Table: 1 row per sample, DQN / Total conc
+  - Peak Table: block-repeat structure, per-peak details + TIC/DQN summary
+  - Electropherogram: Size(bp) x sample RFU (~3000 rows)
+  - Size Calibration: Ladder Size(bp) vs Time(sec), 2 columns
+  - Smear Analysis: sample x range combinations, yield per size range
+
+Filename pattern: YYYY MM DD HHH MMM {file type}.csv
+Sample ID format: SampB1 (Samp + 96-well address); last sample is always ladder.
 """
 import pandas as pd
 import numpy as np
-import xml.etree.ElementTree as ET
 import logging
+import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _read_csv_safe(path: str, **kwargs) -> pd.DataFrame:
+    """Read CSV with UTF-8 / Latin-1 fallback encoding."""
+    try:
+        return pd.read_csv(path, encoding='utf-8', **kwargs)
+    except (UnicodeDecodeError, Exception):
+        return pd.read_csv(path, encoding='latin-1', **kwargs)
+
+
+def _is_ladder(sample_id: str, dqn=None, conc=None) -> bool:
+    """Detect ladder sample: last well + DQN & conc both empty."""
+    if sample_id is None:
+        return True
+    sid = str(sample_id).strip().lower()
+    if 'ladder' in sid:
+        return True
+    # DQN and concentration both missing -> ladder
+    dqn_empty = dqn is None or (isinstance(dqn, float) and np.isnan(dqn))
+    conc_empty = conc is None or (isinstance(conc, float) and np.isnan(conc))
+    if dqn_empty and conc_empty:
+        return True
+    return False
+
+
+def _safe_float(val) -> Optional[float]:
+    """Convert value to float, returning None on failure."""
+    if val is None:
+        return None
+    if isinstance(val, float) and np.isnan(val):
+        return None
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def _strip_samp_prefix(sample_id: str) -> str:
+    """Remove 'Samp' prefix: SampB1 -> B1."""
+    if sample_id and sample_id.startswith('Samp'):
+        return sample_id[4:]
+    return sample_id or ''
+
+
+# ---------------------------------------------------------------------------
+# File-type detection
+# ---------------------------------------------------------------------------
+
+_TYPE_KEYWORDS = {
+    'quality_table': ['quality table', 'quality_table'],
+    'peak_table': ['peak table', 'peak_table'],
+    'electropherogram': ['electropherogram'],
+    'size_calibration': ['size calibration', 'size_calibration'],
+    'smear_analysis': ['smear analysis', 'smear_analysis'],
+}
+
+
+def detect_file_type(file_path: str) -> str:
+    """Detect Femto Pulse file type from filename keywords.
+
+    Returns one of: quality_table, peak_table, electropherogram,
+    size_calibration, smear_analysis, unknown.
+    """
+    name = Path(file_path).stem.lower()
+    for type_name, keywords in _TYPE_KEYWORDS.items():
+        for kw in keywords:
+            if kw in name:
+                return type_name
+    return 'unknown'
+
+
+# ---------------------------------------------------------------------------
+# Folder scanner
+# ---------------------------------------------------------------------------
+
+def scan_femtopulse_folder(folder_path: str) -> Dict[str, Optional[str]]:
+    """Scan a folder and return {type_name: file_path or None} for 5 file types."""
+    folder = Path(folder_path)
+    result = {t: None for t in _TYPE_KEYWORDS}
+
+    if not folder.is_dir():
+        return result
+
+    for f in folder.iterdir():
+        if f.suffix.lower() != '.csv':
+            continue
+        ftype = detect_file_type(str(f))
+        if ftype != 'unknown':
+            result[ftype] = str(f)
+
+    return result
+
+
+def parse_femtopulse_folder(folder_path: str) -> Dict:
+    """Parse all Femto Pulse files in a folder at once.
+
+    Returns:
+        {
+            'folder': str,
+            'files': {type_name: file_path or None},
+            'quality_table': [...] or None,
+            'peak_table': [...] or None,
+            'electropherogram': {...} or None,
+            'size_calibration': [...] or None,
+            'smear_analysis': [...] or None,
+        }
+    """
+    files = scan_femtopulse_folder(folder_path)
+    data: Dict = {
+        'folder': str(folder_path),
+        'files': files,
+    }
+
+    parsers = {
+        'quality_table': parse_quality_table,
+        'peak_table': parse_peak_table,
+        'electropherogram': parse_electropherogram,
+        'size_calibration': parse_size_calibration,
+        'smear_analysis': parse_smear_analysis,
+    }
+
+    for type_name, parser_fn in parsers.items():
+        path = files.get(type_name)
+        if path:
+            try:
+                data[type_name] = parser_fn(path)
+            except Exception as e:
+                logger.error(f"Failed to parse {type_name} ({path}): {e}")
+                data[type_name] = None
+        else:
+            data[type_name] = None
+
+    return data
+
+
+# ---------------------------------------------------------------------------
+# 1. Quality Table parser
+# ---------------------------------------------------------------------------
+
+def parse_quality_table(path: str) -> List[Dict]:
+    """Parse Quality Table CSV.
+
+    Returns list of dicts: {well, sample_id, dqn, threshold, total_concentration}
+    Ladder rows are excluded.
+    """
+    df = _read_csv_safe(path)
+    df.columns = df.columns.str.strip()
+
+    # Auto-detect columns (case-insensitive matching)
+    col_map = _detect_columns(df, {
+        'well': ['well'],
+        'sample_id': ['sample name', 'sample_name', 'sample id', 'name'],
+        'dqn': ['dqn', 'gqn', 'quality number'],
+        'threshold': ['threshold', 'quality threshold'],
+        'total_concentration': ['total concentration', 'total conc', 'concentration', 'conc', 'ng/ul', 'ng/µl'],
+    })
+
+    results = []
+    for _, row in df.iterrows():
+        sid = _get_str(row, col_map.get('sample_id')) or _get_str(row, col_map.get('well'))
+        dqn = _get_float(row, col_map.get('dqn'))
+        conc = _get_float(row, col_map.get('total_concentration'))
+
+        if _is_ladder(sid, dqn, conc):
+            continue
+
+        results.append({
+            'well': _get_str(row, col_map.get('well')) or '',
+            'sample_id': sid or '',
+            'dqn': dqn,
+            'threshold': _get_str(row, col_map.get('threshold')),
+            'total_concentration': conc,
+        })
+
+    logger.info(f"Quality Table: {len(results)} samples from {Path(path).name}")
+    return results
+
+
+# ---------------------------------------------------------------------------
+# 2. Peak Table parser
+# ---------------------------------------------------------------------------
+
+def parse_peak_table(path: str) -> List[Dict]:
+    """Parse Peak Table CSV (block-repeat structure).
+
+    Returns list of dicts:
+        {well, sample_id, peaks: [{...}], tic, tim, total_conc, dqn}
+    """
+    df = _read_csv_safe(path)
+    df.columns = df.columns.str.strip()
+
+    col_map = _detect_columns(df, {
+        'well': ['well'],
+        'sample_id': ['sample name', 'sample_name', 'sample id', 'name'],
+        'peak_id': ['peak id', 'peak', '#'],
+        'size': ['size [bp]', 'size(bp)', 'size'],
+        'pct_total': ['% (conc.)', '% total', 'pct total', '% conc'],
+        'conc': ['nmole/l', 'nmole/l', 'ng/ul', 'ng/µl', 'conc'],
+        'rfu': ['rfu', 'height', 'intensity'],
+        'tic': ['total integrated conc.', 'tic', 'total integrated'],
+        'tim': ['total integrated molarity', 'tim'],
+        'total_conc': ['total conc.', 'total concentration'],
+        'dqn': ['dqn', 'gqn', 'quality number'],
+    })
+
+    # Group by well/sample block
+    well_col = col_map.get('well')
+    sid_col = col_map.get('sample_id')
+
+    results = []
+    current_sample = None
+    current_peaks = []
+
+    for _, row in df.iterrows():
+        well = _get_str(row, well_col) or ''
+        sid = _get_str(row, sid_col) or well
+
+        # New sample block
+        if sid and sid != (current_sample or {}).get('sample_id'):
+            if current_sample is not None:
+                current_sample['peaks'] = current_peaks
+                dqn_val = current_sample.get('_dqn')
+                conc_val = current_sample.get('_conc')
+                if not _is_ladder(current_sample['sample_id'], dqn_val, conc_val):
+                    results.append(current_sample)
+            current_sample = {
+                'well': well,
+                'sample_id': sid,
+                'tic': _get_float(row, col_map.get('tic')),
+                'tim': _get_float(row, col_map.get('tim')),
+                'total_conc': _get_float(row, col_map.get('total_conc')),
+                'dqn': _get_float(row, col_map.get('dqn')),
+                '_dqn': _get_float(row, col_map.get('dqn')),
+                '_conc': _get_float(row, col_map.get('total_conc')),
+            }
+            current_peaks = []
+
+        peak_data = {
+            'size': _get_float(row, col_map.get('size')),
+            'pct_total': _get_float(row, col_map.get('pct_total')),
+            'conc': _get_float(row, col_map.get('conc')),
+            'rfu': _get_float(row, col_map.get('rfu')),
+        }
+        current_peaks.append(peak_data)
+
+        # Update summary fields from any row that has them
+        if current_sample:
+            for field in ('tic', 'tim', 'total_conc', 'dqn'):
+                val = _get_float(row, col_map.get(field))
+                if val is not None:
+                    current_sample[field] = val
+                    if field in ('dqn',):
+                        current_sample['_dqn'] = val
+                    if field in ('total_conc',):
+                        current_sample['_conc'] = val
+
+    # Flush last sample
+    if current_sample is not None:
+        current_sample['peaks'] = current_peaks
+        dqn_val = current_sample.get('_dqn')
+        conc_val = current_sample.get('_conc')
+        if not _is_ladder(current_sample['sample_id'], dqn_val, conc_val):
+            results.append(current_sample)
+
+    # Clean up internal keys
+    for r in results:
+        r.pop('_dqn', None)
+        r.pop('_conc', None)
+
+    logger.info(f"Peak Table: {len(results)} samples from {Path(path).name}")
+    return results
+
+
+# ---------------------------------------------------------------------------
+# 3. Electropherogram parser
+# ---------------------------------------------------------------------------
+
+def parse_electropherogram(path: str) -> Dict:
+    """Parse Electropherogram CSV.
+
+    Returns:
+        {
+            'size_bp': ndarray,
+            'samples': {column_name: ndarray of RFU values},
+        }
+    Includes all columns (including ladder).
+    """
+    df = _read_csv_safe(path)
+    df.columns = df.columns.str.strip()
+
+    # First column is typically Size [bp] or similar
+    size_col = df.columns[0]
+    size_bp = pd.to_numeric(df[size_col], errors='coerce').values
+
+    samples = {}
+    for col in df.columns[1:]:
+        samples[col] = pd.to_numeric(df[col], errors='coerce').values
+
+    logger.info(f"Electropherogram: {len(samples)} channels, {len(size_bp)} points from {Path(path).name}")
+    return {
+        'size_bp': size_bp,
+        'samples': samples,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 4. Size Calibration parser
+# ---------------------------------------------------------------------------
+
+def parse_size_calibration(path: str) -> List[Dict]:
+    """Parse Size Calibration CSV (2-column: Ladder Size(bp) vs Time(sec)).
+
+    Returns list of dicts: {ladder_size_bp, time_sec}
+    """
+    df = _read_csv_safe(path)
+    df.columns = df.columns.str.strip()
+
+    results = []
+    cols = df.columns.tolist()
+    size_col = cols[0] if len(cols) > 0 else None
+    time_col = cols[1] if len(cols) > 1 else None
+
+    for _, row in df.iterrows():
+        results.append({
+            'ladder_size_bp': _safe_float(row[size_col]) if size_col else None,
+            'time_sec': _safe_float(row[time_col]) if time_col else None,
+        })
+
+    logger.info(f"Size Calibration: {len(results)} points from {Path(path).name}")
+    return results
+
+
+# ---------------------------------------------------------------------------
+# 5. Smear Analysis parser
+# ---------------------------------------------------------------------------
+
+def parse_smear_analysis(path: str) -> List[Dict]:
+    """Parse Smear Analysis CSV.
+
+    Returns list of dicts:
+        {well, sample_id, range, pg_ul, pct_total, pmol_l, avg_size, cv, threshold, dqn}
+    """
+    df = _read_csv_safe(path)
+    df.columns = df.columns.str.strip()
+
+    col_map = _detect_columns(df, {
+        'well': ['well'],
+        'sample_id': ['sample name', 'sample_name', 'sample id', 'name'],
+        'range': ['range', 'size range', 'from - to'],
+        'pg_ul': ['pg/ul', 'pg/µl', 'conc', 'concentration'],
+        'pct_total': ['% of total', '% total', 'pct total', '% (conc.)'],
+        'pmol_l': ['pmol/l', 'nmole/l', 'molarity'],
+        'avg_size': ['average size', 'avg. size', 'avg size', 'avg_size'],
+        'cv': ['cv', 'coefficient of variation'],
+        'threshold': ['threshold', 'quality threshold'],
+        'dqn': ['dqn', 'gqn', 'quality number'],
+    })
+
+    results = []
+    for _, row in df.iterrows():
+        sid = _get_str(row, col_map.get('sample_id')) or _get_str(row, col_map.get('well'))
+        dqn = _get_float(row, col_map.get('dqn'))
+        conc = _get_float(row, col_map.get('pg_ul'))
+
+        if _is_ladder(sid, dqn, conc):
+            continue
+
+        results.append({
+            'well': _get_str(row, col_map.get('well')) or '',
+            'sample_id': sid or '',
+            'range': _get_str(row, col_map.get('range')) or '',
+            'pg_ul': _get_float(row, col_map.get('pg_ul')),
+            'pct_total': _get_float(row, col_map.get('pct_total')),
+            'pmol_l': _get_float(row, col_map.get('pmol_l')),
+            'avg_size': _get_float(row, col_map.get('avg_size')),
+            'cv': _get_float(row, col_map.get('cv')),
+            'threshold': _get_str(row, col_map.get('threshold')),
+            'dqn': dqn,
+        })
+
+    logger.info(f"Smear Analysis: {len(results)} rows from {Path(path).name}")
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Column detection helpers
+# ---------------------------------------------------------------------------
+
+def _detect_columns(df: pd.DataFrame, mapping_spec: Dict[str, List[str]]) -> Dict[str, Optional[str]]:
+    """Auto-detect column names using case-insensitive keyword matching.
+
+    mapping_spec: {logical_name: [keyword, ...]}
+    Returns: {logical_name: actual_column_name or None}
+    """
+    lower_cols = {c.lower(): c for c in df.columns}
+    result = {}
+    for logical, keywords in mapping_spec.items():
+        result[logical] = None
+        for kw in keywords:
+            for lc, orig in lower_cols.items():
+                if kw in lc:
+                    result[logical] = orig
+                    break
+            if result[logical]:
+                break
+    return result
+
+
+def _get_str(row: pd.Series, col: Optional[str]) -> Optional[str]:
+    if col is None or col not in row.index:
+        return None
+    val = row[col]
+    return str(val).strip() if pd.notna(val) else None
+
+
+def _get_float(row: pd.Series, col: Optional[str]) -> Optional[float]:
+    if col is None or col not in row.index:
+        return None
+    val = row[col]
+    try:
+        return float(val) if pd.notna(val) else None
+    except (ValueError, TypeError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatible API
+# ---------------------------------------------------------------------------
 
 class FemtoPulseParser:
-    """Femto Pulse 데이터 파싱 클래스"""
-    
+    """Legacy class - maintained for backward compatibility."""
+
     def __init__(self):
         self.supported_formats = ['.csv', '.xml']
-    
+
     def parse_file(self, file_path: str) -> List[Dict]:
-        """
-        Femto Pulse 파일 파싱
-        
-        Args:
-            file_path: Femto Pulse 결과 파일 경로
-            
-        Returns:
-            측정 데이터 리스트 (각 샘플별 딕셔너리)
-        """
-        file_path = Path(file_path)
-        
-        if not file_path.exists():
-            raise FileNotFoundError(f"File not found: {file_path}")
-        
-        if file_path.suffix.lower() not in self.supported_formats:
-            raise ValueError(f"Unsupported file format: {file_path.suffix}")
-        
-        try:
-            if file_path.suffix.lower() == '.csv':
-                results = self._parse_csv(file_path)
-            else:
-                results = self._parse_xml(file_path)
-            
-            logger.info(f"Parsed {len(results)} samples from {file_path.name}")
-            return results
-            
-        except Exception as e:
-            logger.error(f"Failed to parse Femto Pulse file: {e}")
-            raise
-    
-    def _parse_csv(self, file_path: Path) -> List[Dict]:
-        """CSV 형식 파싱"""
-        try:
-            df = pd.read_csv(file_path, encoding='utf-8')
-        except:
-            df = pd.read_csv(file_path, encoding='latin-1')
-        
-        # 컬럼명 정규화
-        df.columns = df.columns.str.strip().str.lower()
-        
-        results = []
-        column_mapping = self._detect_csv_columns(df)
-        
-        for idx, row in df.iterrows():
-            try:
-                data = {
-                    'sample_id': self._get_value(row, column_mapping.get('sample_name')),
-                    'gqn_rin': self._get_float_value(row, column_mapping.get('gqn')),
-                    'concentration': self._get_float_value(row, column_mapping.get('concentration')),
-                    'avg_size': self._get_float_value(row, column_mapping.get('avg_size')),
-                    'peak_size': self._get_float_value(row, column_mapping.get('peak_size')),
-                    'instrument': 'Femto Pulse',
-                    'data_file': str(file_path)
-                }
-                
-                # 유효한 데이터만 추가
-                if data['sample_id']:
-                    results.append(data)
-                    
-            except Exception as e:
-                logger.warning(f"Skip row {idx}: {e}")
-                continue
-        
-        return results
-    
-    def _parse_xml(self, file_path: Path) -> List[Dict]:
-        """XML 형식 파싱 (상세 trace 데이터 포함)"""
-        tree = ET.parse(file_path)
-        root = tree.getroot()
-        
-        results = []
-        
-        # XML 구조는 기기 설정에 따라 다를 수 있음
-        # 일반적인 구조: <Samples><Sample>...</Sample></Samples>
-        for sample in root.findall('.//Sample'):
-            try:
-                data = {
-                    'sample_id': sample.findtext('Name', '').strip(),
-                    'gqn_rin': self._parse_xml_float(sample.findtext('GQN')),
-                    'concentration': self._parse_xml_float(sample.findtext('Concentration')),
-                    'avg_size': self._parse_xml_float(sample.findtext('AverageSize')),
-                    'peak_size': self._parse_xml_float(sample.findtext('PeakSize')),
-                    'instrument': 'Femto Pulse',
-                    'data_file': str(file_path)
-                }
-                
-                # Trace 데이터 추출 (선택적)
-                trace_data = self._extract_trace_data(sample)
-                if trace_data:
-                    data['trace_data'] = trace_data
-                
-                if data['sample_id']:
-                    results.append(data)
-                    
-            except Exception as e:
-                logger.warning(f"Skip XML sample: {e}")
-                continue
-        
-        return results
-    
-    def _detect_csv_columns(self, df: pd.DataFrame) -> Dict[str, str]:
-        """CSV 컬럼명 자동 감지"""
-        mapping = {}
-        
-        # 샘플명
-        sample_keywords = ['sample name', 'sample_name', 'name', 'well']
-        for col in df.columns:
-            if any(keyword in col for keyword in sample_keywords):
-                mapping['sample_name'] = col
-                break
-        
-        # GQN (Genomic Quality Number)
-        gqn_keywords = ['gqn', 'quality number', 'rin']
-        for col in df.columns:
-            if any(keyword in col for keyword in gqn_keywords):
-                mapping['gqn'] = col
-                break
-        
-        # 농도
-        conc_keywords = ['concentration', 'conc', 'ng/ul', 'ng/µl']
-        for col in df.columns:
-            if any(keyword in col for keyword in conc_keywords):
-                mapping['concentration'] = col
-                break
-        
-        # Average Size
-        avg_keywords = ['average size', 'avg size', 'mean size']
-        for col in df.columns:
-            if any(keyword in col for keyword in avg_keywords):
-                mapping['avg_size'] = col
-                break
-        
-        # Peak Size
-        peak_keywords = ['peak size', 'modal size']
-        for col in df.columns:
-            if any(keyword in col for keyword in peak_keywords):
-                mapping['peak_size'] = col
-                break
-        
-        return mapping
-    
-    def _extract_trace_data(self, sample_element) -> Optional[Dict]:
-        """XML에서 trace 데이터 추출 (sizing curve)"""
-        try:
-            trace = sample_element.find('.//Trace')
-            if trace is None:
-                return None
-            
-            # Time/Size와 Intensity 데이터
-            time_data = trace.findtext('TimeData', '')
-            intensity_data = trace.findtext('IntensityData', '')
-            
-            if time_data and intensity_data:
-                times = [float(x) for x in time_data.split(',') if x.strip()]
-                intensities = [float(x) for x in intensity_data.split(',') if x.strip()]
-                
-                return {
-                    'time': times,
-                    'intensity': intensities
-                }
-        except Exception as e:
-            logger.warning(f"Failed to extract trace data: {e}")
-        
-        return None
-    
-    def _get_value(self, row: pd.Series, column: Optional[str]) -> Optional[str]:
-        """행에서 값 추출 (문자열)"""
-        if column is None or column not in row.index:
-            return None
-        value = row[column]
-        return str(value).strip() if pd.notna(value) else None
-    
-    def _get_float_value(self, row: pd.Series, column: Optional[str]) -> Optional[float]:
-        """행에서 값 추출 (실수)"""
-        if column is None or column not in row.index:
-            return None
-        value = row[column]
-        try:
-            return float(value) if pd.notna(value) else None
-        except (ValueError, TypeError):
-            return None
-    
-    def _parse_xml_float(self, value: Optional[str]) -> Optional[float]:
-        """XML 텍스트를 float로 변환"""
-        if value is None:
-            return None
-        try:
-            return float(value.strip())
-        except (ValueError, TypeError):
-            return None
-    
-    def extract_sizing_curve(self, file_path: str, sample_id: str) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-        """
-        특정 샘플의 sizing curve 데이터 추출
-        
-        Args:
-            file_path: Femto Pulse 파일 경로
-            sample_id: 샘플 ID
-            
-        Returns:
-            (size_array, intensity_array) 또는 None
-        """
-        file_path = Path(file_path)
-        
-        if file_path.suffix.lower() == '.xml':
-            tree = ET.parse(file_path)
-            root = tree.getroot()
-            
-            for sample in root.findall('.//Sample'):
-                name = sample.findtext('Name', '').strip()
-                if name == sample_id:
-                    trace_data = self._extract_trace_data(sample)
-                    if trace_data:
-                        return (
-                            np.array(trace_data['time']),
-                            np.array(trace_data['intensity'])
-                        )
-        
-        return None
+        return parse_femtopulse_file(file_path)
 
 
-# 편의 함수
 def parse_femtopulse_file(file_path: str) -> List[Dict]:
-    """Femto Pulse 파일 파싱 헬퍼 함수"""
-    parser = FemtoPulseParser()
-    return parser.parse_file(file_path)
+    """Backward-compatible single-file parser.
+
+    Detects file type and dispatches to the appropriate parser.
+    Returns results in the legacy format: [{sample_id, gqn_rin, concentration,
+    avg_size, peak_size, instrument, data_file}, ...]
+    """
+    file_path = str(file_path)
+    ftype = detect_file_type(file_path)
+
+    if ftype == 'quality_table':
+        rows = parse_quality_table(file_path)
+        return [
+            {
+                'sample_id': r['sample_id'],
+                'gqn_rin': r.get('dqn'),
+                'concentration': r.get('total_concentration'),
+                'avg_size': None,
+                'peak_size': None,
+                'instrument': 'Femto Pulse',
+                'data_file': file_path,
+            }
+            for r in rows
+        ]
+
+    if ftype == 'peak_table':
+        rows = parse_peak_table(file_path)
+        return [
+            {
+                'sample_id': r['sample_id'],
+                'gqn_rin': r.get('dqn'),
+                'concentration': r.get('total_conc'),
+                'avg_size': None,
+                'peak_size': r['peaks'][0]['size'] if r.get('peaks') else None,
+                'instrument': 'Femto Pulse',
+                'data_file': file_path,
+            }
+            for r in rows
+        ]
+
+    if ftype == 'smear_analysis':
+        rows = parse_smear_analysis(file_path)
+        seen = {}
+        for r in rows:
+            sid = r['sample_id']
+            if sid not in seen:
+                seen[sid] = {
+                    'sample_id': sid,
+                    'gqn_rin': r.get('dqn'),
+                    'concentration': r.get('pg_ul'),
+                    'avg_size': r.get('avg_size'),
+                    'peak_size': None,
+                    'instrument': 'Femto Pulse',
+                    'data_file': file_path,
+                }
+        return list(seen.values())
+
+    # Fallback: generic CSV parsing (original behavior)
+    return _parse_generic_csv(file_path)
+
+
+def _parse_generic_csv(file_path: str) -> List[Dict]:
+    """Fallback generic CSV parser (original behavior)."""
+    try:
+        df = _read_csv_safe(file_path)
+    except Exception as e:
+        logger.error(f"Failed to read CSV: {e}")
+        raise
+
+    df.columns = df.columns.str.strip().str.lower()
+
+    col_map = _detect_columns(df, {
+        'sample_name': ['sample name', 'sample_name', 'name', 'well'],
+        'gqn': ['gqn', 'quality number', 'rin', 'dqn'],
+        'concentration': ['concentration', 'conc', 'ng/ul', 'ng/µl', 'total concentration'],
+        'avg_size': ['average size', 'avg. size', 'avg size', 'mean size'],
+        'peak_size': ['peak size', 'modal size'],
+    })
+
+    results = []
+    for _, row in df.iterrows():
+        sid = _get_str(row, col_map.get('sample_name'))
+        if not sid:
+            continue
+        results.append({
+            'sample_id': sid,
+            'gqn_rin': _get_float(row, col_map.get('gqn')),
+            'concentration': _get_float(row, col_map.get('concentration')),
+            'avg_size': _get_float(row, col_map.get('avg_size')),
+            'peak_size': _get_float(row, col_map.get('peak_size')),
+            'instrument': 'Femto Pulse',
+            'data_file': file_path,
+        })
+
+    logger.info(f"Generic CSV: {len(results)} samples from {Path(file_path).name}")
+    return results
 
 
 def get_sizing_curve(file_path: str, sample_id: str) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-    """Sizing curve 추출 헬퍼 함수"""
-    parser = FemtoPulseParser()
-    return parser.extract_sizing_curve(file_path, sample_id)
+    """Extract sizing curve for a specific sample from an Electropherogram file."""
+    ftype = detect_file_type(file_path)
+    if ftype != 'electropherogram':
+        return None
+
+    try:
+        data = parse_electropherogram(file_path)
+        size_bp = data['size_bp']
+        for col_name, rfu in data['samples'].items():
+            if sample_id in col_name:
+                return (size_bp, rfu)
+    except Exception as e:
+        logger.error(f"Failed to extract sizing curve: {e}")
+
+    return None

@@ -189,10 +189,24 @@ def update_qc_metric(session, metric_id, update_data):
 
 
 def delete_qc_metric(session, metric_id):
-    """QC 측정값 삭제"""
+    """QC 측정값 삭제 — Femto Pulse인 경우 RawTrace, SmearAnalysis도 함께 삭제"""
+    from database.models import RawTrace, SmearAnalysis
+
     metric = get_qc_metric_by_id(session, metric_id)
     if not metric:
         return False
+
+    if metric.instrument == 'Femto Pulse':
+        session.query(RawTrace).filter(
+            RawTrace.sample_id == metric.sample_id,
+            RawTrace.step == metric.step,
+            RawTrace.instrument_name == 'Femto Pulse',
+        ).delete()
+        session.query(SmearAnalysis).filter(
+            SmearAnalysis.sample_id == metric.sample_id,
+            SmearAnalysis.step == metric.step,
+        ).delete()
+
     session.delete(metric)
     session.flush()
     return True
@@ -213,8 +227,44 @@ def update_sample(session, sample_id, update_data):
 def add_raw_trace(session, trace_data):
     """Raw trace 파일 정보 추가"""
     from database.models import RawTrace
-    
+
     trace = RawTrace(**trace_data)
     session.add(trace)
     session.flush()
     return trace
+
+
+def add_femtopulse_run(session, data):
+    """FemtoPulseRun 레코드 생성"""
+    from database.models import FemtoPulseRun
+
+    run = FemtoPulseRun(**data)
+    session.add(run)
+    session.flush()
+    return run
+
+
+def get_femtopulse_run(session, run_id):
+    """FemtoPulseRun PK로 조회"""
+    from database.models import FemtoPulseRun
+    return session.query(FemtoPulseRun).filter(FemtoPulseRun.id == run_id).first()
+
+
+def add_smear_analysis(session, data):
+    """SmearAnalysis 레코드 생성"""
+    from database.models import SmearAnalysis
+
+    sa = SmearAnalysis(**data)
+    session.add(sa)
+    session.flush()
+    return sa
+
+
+def get_smear_analyses_by_sample(session, sample_id, step=None):
+    """특정 샘플의 SmearAnalysis 조회 (step 필터 옵션)"""
+    from database.models import SmearAnalysis
+
+    query = session.query(SmearAnalysis).filter(SmearAnalysis.sample_id == sample_id)
+    if step:
+        query = query.filter(SmearAnalysis.step == step)
+    return query.order_by(SmearAnalysis.created_at).all()

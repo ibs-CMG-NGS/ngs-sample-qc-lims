@@ -118,12 +118,60 @@ class RawTrace(Base):
 class ExperimentBatch(Base):
     """실험 배치 정보 (향후 확장용)"""
     __tablename__ = 'experiment_batches'
-    
+
     id = Column(Integer, primary_key=True, autoincrement=True)
     batch_id = Column(String(100), unique=True, nullable=False)
     batch_name = Column(String(200))
     description = Column(String(500))
     created_at = Column(DateTime, default=datetime.now)
-    
+
     def __repr__(self):
         return f"<ExperimentBatch(id={self.batch_id})>"
+
+
+class FemtoPulseRun(Base):
+    """Femto Pulse 실행 단위 — 5종 파일 경로 추적"""
+    __tablename__ = 'femtopulse_runs'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_folder = Column(String(500), nullable=False)
+    step = Column(String(50), nullable=False)
+
+    quality_table_path = Column(String(500))
+    peak_table_path = Column(String(500))
+    electropherogram_path = Column(String(500))
+    size_calibration_path = Column(String(500))
+    smear_analysis_path = Column(String(500))
+
+    created_at = Column(DateTime, default=datetime.now)
+
+    smear_analyses = relationship("SmearAnalysis", back_populates="run", cascade="all, delete-orphan")
+
+    def __repr__(self):
+        return f"<FemtoPulseRun(id={self.id}, step={self.step})>"
+
+
+class SmearAnalysis(Base):
+    """Smear Analysis 결과 — 샘플 x range 별"""
+    __tablename__ = 'smear_analyses'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    sample_id = Column(String(100), ForeignKey('samples.sample_id'), nullable=False)
+    step = Column(String(50))
+    run_id = Column(Integer, ForeignKey('femtopulse_runs.id'))
+
+    range_text = Column(String(100))
+    pg_ul = Column(Float)
+    pct_total = Column(Float)
+    pmol_l = Column(Float)
+    avg_size = Column(Float)
+    cv = Column(Float)
+    threshold = Column(String(50))
+    dqn = Column(Float)
+
+    created_at = Column(DateTime, default=datetime.now)
+
+    run = relationship("FemtoPulseRun", back_populates="smear_analyses")
+
+    def __repr__(self):
+        return f"<SmearAnalysis(sample={self.sample_id}, range={self.range_text})>"

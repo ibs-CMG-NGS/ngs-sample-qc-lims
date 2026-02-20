@@ -5,17 +5,26 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QTableWidget, QTableWidgetItem, QPushButton,
     QHeaderView, QLabel, QMessageBox, QAbstractItemView,
-    QMenu, QAction,
+    QMenu, QAction, QDialog, QDialogButtonBox,
 )
 from PyQt5.QtCore import Qt
 import logging
+
+try:
+    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+    from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
+    HAS_MPL_QT = True
+except ImportError:
+    HAS_MPL_QT = False
 
 from config.settings import QC_STEPS, STATUS_COLORS
 from database import (
     db_manager, get_all_samples, get_latest_qc_metric,
     get_qc_metrics_by_sample, delete_qc_metric, delete_sample,
+    get_smear_analyses_by_sample,
 )
 from ui.dialogs import SampleDialog, NanoDropDialog, QubitDialog, FemtoPulseDialog
+from analysis.visualizer import load_electropherogram_traces, qc_visualizer
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +35,7 @@ SAMPLE_COLS = ["Sample ID", "Name", "Type", "Source", "Latest Status", "Created"
 QC_COLS = [
     "Step", "Instrument", "Conc", "Vol", "Total",
     "Recovery", "260/280", "GQN", "AvgSize",
+    "1k-10k%", "10k-165k%",
     "Molarity", "Status", "Date",
 ]
 
@@ -74,6 +84,10 @@ class SampleTab(QWidget):
         btn_femto.clicked.connect(self._open_femtopulse)
         btn_bar.addWidget(btn_femto)
 
+        btn_electro = QPushButton("Electropherogram")
+        btn_electro.clicked.connect(self._open_electropherogram)
+        btn_bar.addWidget(btn_electro)
+
         btn_bar.addStretch()
 
         btn_refresh = QPushButton("Refresh")
@@ -98,8 +112,9 @@ class SampleTab(QWidget):
         self.sample_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.sample_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.sample_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.Stretch
+            QHeaderView.Interactive
         )
+        self.sample_table.horizontalHeader().setStretchLastSection(True)
         self.sample_table.setSortingEnabled(True)
         self.sample_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.sample_table.customContextMenuRequested.connect(self._on_sample_context_menu)
@@ -123,8 +138,9 @@ class SampleTab(QWidget):
         self.qc_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.qc_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.qc_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.Stretch
+            QHeaderView.Interactive
         )
+        self.qc_table.horizontalHeader().setStretchLastSection(True)
         self.qc_table.doubleClicked.connect(self._on_qc_double_click)
         self.qc_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.qc_table.customContextMenuRequested.connect(self._on_qc_context_menu)
@@ -221,6 +237,10 @@ class SampleTab(QWidget):
         fp_action.triggered.connect(self._open_femtopulse)
         menu.addAction(fp_action)
 
+        ep_action = QAction("View Electropherogram", self)
+        ep_action.triggered.connect(lambda: self._show_electropherogram_for(sample_id))
+        menu.addAction(ep_action)
+
         menu.addSeparator()
 
         del_action = QAction("Delete Sample", self)
@@ -287,6 +307,12 @@ class SampleTab(QWidget):
                 if not metrics:
                     return
 
+                # Pre-load smear analyses grouped by step
+                smear_all = get_smear_analyses_by_sample(session, sample_id)
+                smear_by_step = {}  # step -> {range_text: SmearAnalysis}
+                for sa in smear_all:
+                    smear_by_step.setdefault(sa.step, {})[sa.range_text or ''] = sa
+
                 self.qc_table.setRowCount(len(metrics))
                 recoveries = self._calc_recovery(metrics)
 
@@ -319,8 +345,22 @@ class SampleTab(QWidget):
                     self.qc_table.setItem(
                         row, 8, QTableWidgetItem(_fmt(m.avg_size))
                     )
+
+                    # Smear %Total columns (Femto Pulse only)
+                    pct_1k_10k = "-"
+                    pct_10k_165k = "-"
+                    step_smears = smear_by_step.get(m.step, {})
+                    if m.instrument == 'Femto Pulse' and step_smears:
+                        for rng, sa in step_smears.items():
+                            if '1000' in rng and '10000' in rng and '165' not in rng:
+                                pct_1k_10k = _fmt(sa.pct_total)
+                            elif '10000' in rng and '165' in rng:
+                                pct_10k_165k = _fmt(sa.pct_total)
+                    self.qc_table.setItem(row, 9, QTableWidgetItem(pct_1k_10k))
+                    self.qc_table.setItem(row, 10, QTableWidgetItem(pct_10k_165k))
+
                     self.qc_table.setItem(
-                        row, 9, QTableWidgetItem(_fmt(m.molarity))
+                        row, 11, QTableWidgetItem(_fmt(m.molarity))
                     )
 
                     status_text = m.status or "-"
@@ -329,15 +369,15 @@ class SampleTab(QWidget):
                     if color:
                         from PyQt5.QtGui import QColor
                         status_item.setForeground(QColor(color))
-                    self.qc_table.setItem(row, 10, status_item)
+                    self.qc_table.setItem(row, 12, status_item)
 
                     date_str = (
-                        m.measured_at.strftime("%Y-%m-%d %H:%M")
+                        m.measured_at.strftime("%Y-%m-%d")
                         if m.measured_at
                         else "-"
                     )
                     self.qc_table.setItem(
-                        row, 11, QTableWidgetItem(date_str)
+                        row, 13, QTableWidgetItem(date_str)
                     )
 
         except Exception as e:
@@ -490,3 +530,51 @@ class SampleTab(QWidget):
             self.refresh_samples()
             if self._selected_sample_id:
                 self._load_qc_details(self._selected_sample_id)
+
+    def _open_electropherogram(self):
+        sample_id = self._get_selected_sample_id()
+        if not sample_id:
+            return
+        self._show_electropherogram_for(sample_id)
+
+    def _show_electropherogram_for(self, sample_id):
+        """Load traces and display electropherogram overlay in a dialog."""
+        if not HAS_MPL_QT:
+            QMessageBox.warning(
+                self, "Missing Dependency",
+                "matplotlib Qt5 backend is required for electropherogram display.",
+            )
+            return
+
+        traces, ladder_points = load_electropherogram_traces(sample_id)
+        if not traces:
+            QMessageBox.information(
+                self, "No Data",
+                f"No electropherogram traces found for '{sample_id}'.\n"
+                "Upload Femto Pulse data with an Electropherogram file first.",
+            )
+            return
+
+        fig = qc_visualizer.plot_electropherogram_overlay(
+            sample_id, traces, ladder_points=ladder_points
+        )
+        if fig is None:
+            return
+
+        # Create a dialog with embedded matplotlib canvas
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Electropherogram - {sample_id}")
+        dlg.setMinimumSize(900, 600)
+
+        layout = QVBoxLayout(dlg)
+
+        canvas = FigureCanvas(fig)
+        toolbar = NavigationToolbar(canvas, dlg)
+        layout.addWidget(toolbar)
+        layout.addWidget(canvas)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.accept)
+        layout.addWidget(close_btn)
+
+        dlg.exec_()

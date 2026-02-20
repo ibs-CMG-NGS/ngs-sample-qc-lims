@@ -2,13 +2,15 @@
 다이얼로그 모음 - SampleDialog, NanoDropDialog, QubitDialog, FemtoPulseDialog
 """
 import os
+from datetime import date, datetime
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLineEdit, QComboBox, QLabel, QPushButton, QDialogButtonBox,
     QFileDialog, QTableWidget, QTableWidgetItem, QMessageBox,
-    QHeaderView, QDoubleSpinBox, QTextEdit,
+    QHeaderView, QDoubleSpinBox, QTextEdit, QAbstractItemView,
+    QDateEdit,
 )
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QDate
 import logging
 
 from config.settings import SAMPLE_TYPES, QC_STEPS
@@ -16,8 +18,16 @@ from database import (
     db_manager, add_sample, get_sample_by_id, update_sample,
     add_qc_metric, get_qc_metrics_by_sample, add_raw_trace,
     get_qc_metric_by_id, update_qc_metric,
+    add_femtopulse_run, add_smear_analysis,
 )
-from parsers import parse_femtopulse_file
+from parsers import (
+    parse_femtopulse_file,
+    scan_femtopulse_folder,
+    parse_quality_table,
+    parse_smear_analysis,
+    parse_femtopulse_folder,
+    _strip_samp_prefix,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +181,12 @@ class NanoDropDialog(QDialog):
             self.step_combo.addItem(s)
         form.addRow("Step:", self.step_combo)
 
+        self.date_edit = QDateEdit()
+        self.date_edit.setCalendarPopup(True)
+        self.date_edit.setDate(QDate.currentDate())
+        self.date_edit.setDisplayFormat("yyyy-MM-dd")
+        form.addRow("Measured Date:", self.date_edit)
+
         layout.addLayout(form)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -194,18 +210,25 @@ class NanoDropDialog(QDialog):
                 idx = self.step_combo.findText(m.step)
                 if idx >= 0:
                     self.step_combo.setCurrentIndex(idx)
+                if m.measured_at:
+                    self.date_edit.setDate(QDate(
+                        m.measured_at.year, m.measured_at.month, m.measured_at.day
+                    ))
         except Exception as e:
             logger.error(f"Failed to load metric: {e}")
 
     def _on_accept(self):
         step = self.step_combo.currentText()
         r230 = self.r230_spin.value() if self.r230_spin.value() > 0 else None
+        qd = self.date_edit.date()
+        measured_at = datetime(qd.year(), qd.month(), qd.day())
 
         data = {
             "step": step,
             "concentration": self.conc_spin.value(),
             "purity_260_280": self.r280_spin.value(),
             "purity_260_230": r230,
+            "measured_at": measured_at,
         }
 
         try:
@@ -278,6 +301,12 @@ class QubitDialog(QDialog):
         self.recovery_label = QLabel("-")
         form.addRow("Recovery:", self.recovery_label)
 
+        self.date_edit = QDateEdit()
+        self.date_edit.setCalendarPopup(True)
+        self.date_edit.setDate(QDate.currentDate())
+        self.date_edit.setDisplayFormat("yyyy-MM-dd")
+        form.addRow("Measured Date:", self.date_edit)
+
         layout.addLayout(form)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -299,6 +328,10 @@ class QubitDialog(QDialog):
                 idx = self.step_combo.findText(m.step)
                 if idx >= 0:
                     self.step_combo.setCurrentIndex(idx)
+                if m.measured_at:
+                    self.date_edit.setDate(QDate(
+                        m.measured_at.year, m.measured_at.month, m.measured_at.day
+                    ))
         except Exception as e:
             logger.error(f"Failed to load metric: {e}")
 
@@ -343,12 +376,15 @@ class QubitDialog(QDialog):
         total = self._get_total()
         step = self.step_combo.currentText()
         assay = self.assay_edit.text().strip() or None
+        qd = self.date_edit.date()
+        measured_at = datetime(qd.year(), qd.month(), qd.day())
 
         data = {
             "step": step,
             "concentration": self.conc_spin.value(),
             "volume": self.vol_spin.value(),
             "total_amount": total,
+            "measured_at": measured_at,
         }
 
         try:
@@ -373,50 +409,84 @@ class QubitDialog(QDialog):
 
 
 class FemtoPulseDialog(QDialog):
-    """Femto Pulse 파일 업로드 다이얼로그"""
+    """Femto Pulse 폴더 업로드 다이얼로그 — 5종 파일 일괄 처리"""
+
+    _FILE_TYPES = [
+        'quality_table', 'peak_table', 'electropherogram',
+        'size_calibration', 'smear_analysis',
+    ]
+    _TYPE_LABELS = {
+        'quality_table': 'Quality Table',
+        'peak_table': 'Peak Table',
+        'electropherogram': 'Electropherogram',
+        'size_calibration': 'Size Calibration',
+        'smear_analysis': 'Smear Analysis',
+    }
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Femto Pulse Upload")
-        self.setMinimumSize(700, 500)
-        self.parsed_results = []
+        self.setWindowTitle("Femto Pulse Folder Upload")
+        self.setMinimumSize(800, 600)
+        self._folder_path = None
+        self._file_map = {}          # {type: path}
+        self._quality_rows = []      # parsed quality table rows
+        self._folder_data = None     # full parse result
         self._build_ui()
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
 
-        # File selection row
-        file_row = QHBoxLayout()
-        self.file_edit = QLineEdit()
-        self.file_edit.setReadOnly(True)
-        self.file_edit.setPlaceholderText("Select CSV or XML file...")
-        file_row.addWidget(self.file_edit)
+        # Folder selection
+        folder_row = QHBoxLayout()
+        self.folder_edit = QLineEdit()
+        self.folder_edit.setReadOnly(True)
+        self.folder_edit.setPlaceholderText("Select Femto Pulse run folder...")
+        folder_row.addWidget(self.folder_edit)
 
-        browse_btn = QPushButton("Browse...")
-        browse_btn.clicked.connect(self._browse_file)
-        file_row.addWidget(browse_btn)
-        layout.addLayout(file_row)
+        browse_btn = QPushButton("Browse Folder")
+        browse_btn.clicked.connect(self._browse_folder)
+        folder_row.addWidget(browse_btn)
+        layout.addLayout(folder_row)
 
-        # Step selection
+        # Step + Date row
         step_row = QHBoxLayout()
         step_row.addWidget(QLabel("Step:"))
         self.step_combo = QComboBox()
         for s in QC_STEPS:
             self.step_combo.addItem(s)
         step_row.addWidget(self.step_combo)
+        step_row.addSpacing(20)
+        step_row.addWidget(QLabel("Measured Date:"))
+        self.date_edit = QDateEdit()
+        self.date_edit.setCalendarPopup(True)
+        self.date_edit.setDate(QDate.currentDate())
+        self.date_edit.setDisplayFormat("yyyy-MM-dd")
+        step_row.addWidget(self.date_edit)
         step_row.addStretch()
         layout.addLayout(step_row)
 
-        # Preview table
-        layout.addWidget(QLabel("Parsed Results:"))
+        # File checklist (5 rows)
+        layout.addWidget(QLabel("Detected Files:"))
+        self.file_table = QTableWidget()
+        self.file_table.setColumnCount(2)
+        self.file_table.setHorizontalHeaderLabels(["File Type", "File Name"])
+        self.file_table.setRowCount(5)
+        self.file_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.file_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.file_table.setMaximumHeight(160)
+        for row, ft in enumerate(self._FILE_TYPES):
+            self.file_table.setItem(row, 0, QTableWidgetItem(self._TYPE_LABELS[ft]))
+            self.file_table.setItem(row, 1, QTableWidgetItem("not found"))
+        layout.addWidget(self.file_table)
+
+        # Sample preview table
+        layout.addWidget(QLabel("Sample Preview (from Quality Table):"))
         self.preview_table = QTableWidget()
-        self.preview_table.setColumnCount(6)
+        self.preview_table.setColumnCount(5)
         self.preview_table.setHorizontalHeaderLabels([
-            "File Sample ID", "DB Sample ID", "GQN", "Conc", "Avg Size", "Peak Size"
+            "Well", "File Sample", "DB Sample ID", "DQN", "Conc (ng/ul)",
         ])
-        self.preview_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.Stretch
-        )
+        self.preview_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         layout.addWidget(self.preview_table)
 
         # Buttons
@@ -427,70 +497,129 @@ class FemtoPulseDialog(QDialog):
         self.ok_button.setEnabled(False)
         layout.addWidget(buttons)
 
-    def _browse_file(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select Femto Pulse File", "",
-            "Data Files (*.csv *.xml);;All Files (*)",
+    def _browse_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select Femto Pulse Run Folder"
         )
-        if not path:
+        if not folder:
             return
 
-        self.file_edit.setText(path)
-        try:
-            self.parsed_results = parse_femtopulse_file(path)
-        except Exception as e:
-            QMessageBox.critical(self, "Parse Error", f"Failed to parse file:\n{e}")
-            self.parsed_results = []
-            return
+        self._folder_path = folder
+        self.folder_edit.setText(folder)
 
-        if not self.parsed_results:
-            QMessageBox.information(self, "No Data", "No results found in file.")
-            return
+        # Scan files
+        self._file_map = scan_femtopulse_folder(folder)
+        for row, ft in enumerate(self._FILE_TYPES):
+            path = self._file_map.get(ft)
+            if path:
+                from pathlib import Path as _P
+                self.file_table.setItem(row, 1, QTableWidgetItem(_P(path).name))
+            else:
+                item = QTableWidgetItem("not found")
+                item.setForeground(Qt.gray)
+                self.file_table.setItem(row, 1, item)
+
+        # Parse quality table for preview
+        qt_path = self._file_map.get('quality_table')
+        if qt_path:
+            try:
+                self._quality_rows = parse_quality_table(qt_path)
+            except Exception as e:
+                QMessageBox.warning(self, "Parse Warning",
+                                    f"Failed to parse Quality Table:\n{e}")
+                self._quality_rows = []
+        else:
+            self._quality_rows = []
 
         self._populate_preview()
-        self.ok_button.setEnabled(True)
+        # Enable OK when quality table is loaded; actual import requires at least one DB Sample ID
+        self.ok_button.setEnabled(len(self._quality_rows) > 0)
 
     def _populate_preview(self):
-        self.preview_table.setRowCount(len(self.parsed_results))
-        for row, r in enumerate(self.parsed_results):
-            file_sid = r.get("sample_id", "")
-            self.preview_table.setItem(row, 0, QTableWidgetItem(file_sid))
+        self.preview_table.setRowCount(len(self._quality_rows))
+        for row, r in enumerate(self._quality_rows):
+            file_sid = r.get('sample_id', '')
 
-            # Editable DB sample ID — defaults to file sample ID
-            db_id_item = QTableWidgetItem(file_sid)
-            self.preview_table.setItem(row, 1, db_id_item)
+            well_item = QTableWidgetItem(r.get('well', ''))
+            well_item.setFlags(well_item.flags() & ~Qt.ItemIsEditable)
+            self.preview_table.setItem(row, 0, well_item)
+
+            fsid_item = QTableWidgetItem(file_sid)
+            fsid_item.setFlags(fsid_item.flags() & ~Qt.ItemIsEditable)
+            self.preview_table.setItem(row, 1, fsid_item)
+
+            # DB Sample ID: blank by default — user fills in only samples to import
+            db_id_item = QTableWidgetItem('')
+            db_id_item.setToolTip("Enter DB Sample ID to import this row")
+            self.preview_table.setItem(row, 2, db_id_item)
 
             def _fmt(v):
                 return f"{v:.2f}" if v is not None else "-"
 
-            gqn_item = QTableWidgetItem(_fmt(r.get("gqn_rin")))
-            gqn_item.setFlags(gqn_item.flags() & ~Qt.ItemIsEditable)
-            self.preview_table.setItem(row, 2, gqn_item)
+            dqn_item = QTableWidgetItem(_fmt(r.get('dqn')))
+            dqn_item.setFlags(dqn_item.flags() & ~Qt.ItemIsEditable)
+            self.preview_table.setItem(row, 3, dqn_item)
 
-            conc_item = QTableWidgetItem(_fmt(r.get("concentration")))
+            conc_item = QTableWidgetItem(_fmt(r.get('total_concentration')))
             conc_item.setFlags(conc_item.flags() & ~Qt.ItemIsEditable)
-            self.preview_table.setItem(row, 3, conc_item)
-
-            avg_item = QTableWidgetItem(_fmt(r.get("avg_size")))
-            avg_item.setFlags(avg_item.flags() & ~Qt.ItemIsEditable)
-            self.preview_table.setItem(row, 4, avg_item)
-
-            peak_item = QTableWidgetItem(_fmt(r.get("peak_size")))
-            peak_item.setFlags(peak_item.flags() & ~Qt.ItemIsEditable)
-            self.preview_table.setItem(row, 5, peak_item)
+            self.preview_table.setItem(row, 4, conc_item)
 
     def _on_accept(self):
         step = self.step_combo.currentText()
-        file_path = self.file_edit.text()
+        qd = self.date_edit.date()
+        measured_at = datetime(qd.year(), qd.month(), qd.day())
         saved = 0
         skipped = []
+        smear_saved = 0
 
         try:
             with db_manager.session_scope() as session:
-                for row, r in enumerate(self.parsed_results):
-                    db_sid_item = self.preview_table.item(row, 1)
-                    db_sid = db_sid_item.text().strip() if db_sid_item else ""
+                # 1. Create FemtoPulseRun record
+                run = add_femtopulse_run(session, {
+                    'run_folder': self._folder_path,
+                    'step': step,
+                    'quality_table_path': self._file_map.get('quality_table'),
+                    'peak_table_path': self._file_map.get('peak_table'),
+                    'electropherogram_path': self._file_map.get('electropherogram'),
+                    'size_calibration_path': self._file_map.get('size_calibration'),
+                    'smear_analysis_path': self._file_map.get('smear_analysis'),
+                })
 
+                # Build file_sample_id -> db_sample_id mapping (only filled rows)
+                sid_map = {}  # file_sample_id -> db_sample_id
+                for row, r in enumerate(self._quality_rows):
+                    db_sid_item = self.preview_table.item(row, 2)
+                    db_sid = db_sid_item.text().strip() if db_sid_item else ""
+                    file_sid = r.get('sample_id', '')
+                    if db_sid:
+                        sid_map[file_sid] = db_sid
+
+                if not sid_map:
+                    QMessageBox.warning(
+                        self, "No Samples",
+                        "Enter at least one DB Sample ID to import.",
+                    )
+                    return
+
+                # Pre-parse smear analysis for avg_size lookup
+                smear_by_file_sid = {}  # file_sid -> {range: row_dict}
+                smear_path = self._file_map.get('smear_analysis')
+                smear_rows_all = []
+                if smear_path:
+                    try:
+                        smear_rows_all = parse_smear_analysis(smear_path)
+                        for sr in smear_rows_all:
+                            fsid = sr.get('sample_id', '')
+                            rng = sr.get('range', '')
+                            smear_by_file_sid.setdefault(fsid, {})[rng] = sr
+                    except Exception as e:
+                        logger.warning(f"Smear analysis pre-parse failed: {e}")
+
+                # 2. Save QCMetric + RawTrace per sample
+                electro_path = self._file_map.get('electropherogram')
+                for row, r in enumerate(self._quality_rows):
+                    file_sid = r.get('sample_id', '')
+                    db_sid = sid_map.get(file_sid, '')
                     if not db_sid:
                         continue
 
@@ -499,25 +628,67 @@ class FemtoPulseDialog(QDialog):
                         skipped.append(db_sid)
                         continue
 
+                    # Lookup avg_size from smear "10000 bp to 165000 bp" range
+                    smear_ranges = smear_by_file_sid.get(file_sid, {})
+                    avg_size = None
+                    for rng_key, sr_data in smear_ranges.items():
+                        if '10000' in rng_key and '165' in rng_key:
+                            avg_size = sr_data.get('avg_size')
+                            break
+
                     add_qc_metric(session, {
-                        "sample_id": db_sid,
-                        "step": step,
-                        "concentration": r.get("concentration"),
-                        "gqn_rin": r.get("gqn_rin"),
-                        "avg_size": r.get("avg_size"),
-                        "peak_size": r.get("peak_size"),
-                        "instrument": "Femto Pulse",
-                        "data_file": file_path,
+                        'sample_id': db_sid,
+                        'step': step,
+                        'concentration': r.get('total_concentration'),
+                        'gqn_rin': r.get('dqn'),
+                        'avg_size': avg_size,
+                        'instrument': 'Femto Pulse',
+                        'data_file': self._file_map.get('quality_table'),
+                        'measured_at': measured_at,
                     })
-                    add_raw_trace(session, {
-                        "sample_id": db_sid,
-                        "step": step,
-                        "raw_file_path": file_path,
-                        "instrument_name": "Femto Pulse",
-                    })
+
+                    if electro_path:
+                        add_raw_trace(session, {
+                            'sample_id': db_sid,
+                            'step': step,
+                            'raw_file_path': electro_path,
+                            'image_path': file_sid,  # 원본 파일 Sample ID (컬럼 매칭용)
+                            'instrument_name': 'Femto Pulse',
+                            'assay_type': 'Electropherogram',
+                        })
                     saved += 1
 
-            msg = f"Saved {saved} record(s)."
+                # 3. Save Smear Analysis records (using pre-parsed data)
+                if smear_rows_all:
+                    try:
+                        for sr in smear_rows_all:
+                            file_sid = sr.get('sample_id', '')
+                            db_sid = sid_map.get(file_sid, '')
+                            if not db_sid:
+                                continue
+                            sample = get_sample_by_id(session, db_sid)
+                            if not sample:
+                                continue
+                            add_smear_analysis(session, {
+                                'sample_id': db_sid,
+                                'step': step,
+                                'run_id': run.id,
+                                'range_text': sr.get('range'),
+                                'pg_ul': sr.get('pg_ul'),
+                                'pct_total': sr.get('pct_total'),
+                                'pmol_l': sr.get('pmol_l'),
+                                'avg_size': sr.get('avg_size'),
+                                'cv': sr.get('cv'),
+                                'threshold': sr.get('threshold'),
+                                'dqn': sr.get('dqn'),
+                            })
+                            smear_saved += 1
+                    except Exception as e:
+                        logger.warning(f"Smear analysis save failed: {e}")
+
+            msg = f"Saved {saved} QC record(s)."
+            if smear_saved:
+                msg += f"\nSmear Analysis: {smear_saved} record(s)."
             if skipped:
                 msg += f"\nSkipped (not in DB): {', '.join(skipped)}"
             QMessageBox.information(self, "Complete", msg)
