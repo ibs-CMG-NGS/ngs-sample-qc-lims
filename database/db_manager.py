@@ -287,3 +287,43 @@ def get_smear_analyses_by_sample(session, sample_id, step=None):
     if step:
         query = query.filter(SmearAnalysis.step == step)
     return query.order_by(SmearAnalysis.created_at).all()
+
+
+# ── SampleNote CRUD ───────────────────────────────────────────────
+
+def add_note(session, sample_id: str, note_text: str):
+    """샘플 메모 추가"""
+    from database.models import SampleNote
+    note = SampleNote(sample_id=sample_id, note_text=note_text)
+    session.add(note)
+    session.flush()
+    return note
+
+
+def get_notes_by_sample(session, sample_id: str):
+    """샘플의 모든 메모 조회 (최신순)"""
+    from database.models import SampleNote
+    return (session.query(SampleNote)
+            .filter(SampleNote.sample_id == sample_id)
+            .order_by(SampleNote.created_at.desc())
+            .all())
+
+
+def update_note(session, note_id: int, note_text: str):
+    """메모 수정"""
+    from database.models import SampleNote
+    note = session.query(SampleNote).filter(SampleNote.id == note_id).first()
+    if note:
+        note.note_text = note_text
+        session.flush()
+    return note
+
+
+def delete_note(session, note_id: int):
+    """메모 삭제"""
+    from database.models import SampleNote
+    note = session.query(SampleNote).filter(SampleNote.id == note_id).first()
+    if note:
+        session.delete(note)
+        session.flush()
+    return note is not None

@@ -1,5 +1,5 @@
 """
-다이얼로그 모음 - SampleDialog, NanoDropDialog, QubitDialog, FemtoPulseDialog
+다이얼로그 모음 - SampleDialog, NanoDropDialog, QubitDialog, FemtoPulseDialog, NoteDialog
 """
 import os
 from datetime import date, datetime
@@ -8,9 +8,10 @@ from PyQt5.QtWidgets import (
     QLineEdit, QComboBox, QLabel, QPushButton, QDialogButtonBox,
     QFileDialog, QTableWidget, QTableWidgetItem, QMessageBox,
     QHeaderView, QDoubleSpinBox, QTextEdit, QAbstractItemView,
-    QDateEdit,
+    QDateEdit, QListWidget, QListWidgetItem, QSplitter,
 )
 from PyQt5.QtCore import Qt, QDate
+from PyQt5.QtGui import QFont
 import logging
 
 from config.settings import SAMPLE_TYPES, QC_STEPS, SPECIES_LIST, MATERIAL_LIST
@@ -19,7 +20,9 @@ from database import (
     add_qc_metric, get_qc_metrics_by_sample, add_raw_trace,
     get_qc_metric_by_id, update_qc_metric,
     add_femtopulse_run, add_smear_analysis,
+    add_note, get_notes_by_sample, update_note, delete_note,
 )
+from analysis.qc_judge import qc_judge
 from parsers import (
     parse_femtopulse_file,
     scan_femtopulse_folder,
@@ -254,6 +257,13 @@ class NanoDropDialog(QDialog):
 
         try:
             with db_manager.session_scope() as session:
+                # QC 자동 판정
+                sample = get_sample_by_id(session, self.sample_id)
+                if sample:
+                    data["status"] = qc_judge.judge_qc(sample.sample_type, {
+                        "concentration": data["concentration"],
+                        "step": step,
+                    })
                 if self._edit_metric_id:
                     update_qc_metric(session, self._edit_metric_id, data)
                 else:
@@ -410,6 +420,14 @@ class QubitDialog(QDialog):
 
         try:
             with db_manager.session_scope() as session:
+                # QC 자동 판정
+                sample = get_sample_by_id(session, self.sample_id)
+                if sample:
+                    data["status"] = qc_judge.judge_qc(sample.sample_type, {
+                        "concentration": data["concentration"],
+                        "total_amount": total,
+                        "step": step,
+                    })
                 if self._edit_metric_id:
                     update_qc_metric(session, self._edit_metric_id, data)
                 else:
@@ -657,12 +675,22 @@ class FemtoPulseDialog(QDialog):
                             avg_size = sr_data.get('avg_size')
                             break
 
-                    add_qc_metric(session, {
-                        'sample_id': db_sid,
-                        'step': step,
+                    fp_qc_data = {
                         'concentration': r.get('total_concentration'),
                         'gqn_rin': r.get('dqn'),
                         'avg_size': avg_size,
+                        'step': step,
+                    }
+                    fp_qc_data['status'] = qc_judge.judge_qc(
+                        sample.sample_type, fp_qc_data
+                    )
+                    add_qc_metric(session, {
+                        'sample_id': db_sid,
+                        'step': step,
+                        'concentration': fp_qc_data['concentration'],
+                        'gqn_rin': fp_qc_data['gqn_rin'],
+                        'avg_size': fp_qc_data['avg_size'],
+                        'status': fp_qc_data['status'],
                         'instrument': 'Femto Pulse',
                         'data_file': self._file_map.get('quality_table'),
                         'measured_at': measured_at,
@@ -718,3 +746,171 @@ class FemtoPulseDialog(QDialog):
         except Exception as e:
             logger.error(f"FemtoPulse save failed: {e}")
             QMessageBox.critical(self, "Error", f"Failed to save:\n{e}")
+
+
+class NoteDialog(QDialog):
+    """샘플 메모 관리 다이얼로그 — 목록 조회 / 추가 / 수정 / 삭제"""
+
+    def __init__(self, sample_id: str, parent=None):
+        super().__init__(parent)
+        self.sample_id = sample_id
+        self.setWindowTitle(f"Notes — {sample_id}")
+        self.setMinimumSize(560, 400)
+        self._note_ids: list[int] = []   # 목록 행 → DB id 매핑
+        self._build_ui()
+        self._load_notes()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+
+        # ── 목록 + 미리보기 스플리터 ──────────────────────────────
+        splitter = QSplitter(Qt.Vertical)
+
+        # 위: 노트 목록
+        self.list_widget = QListWidget()
+        self.list_widget.currentRowChanged.connect(self._on_row_changed)
+        splitter.addWidget(self.list_widget)
+
+        # 아래: 선택된 노트 본문 미리보기 (읽기 전용)
+        self.preview = QTextEdit()
+        self.preview.setReadOnly(True)
+        self.preview.setPlaceholderText("노트를 선택하면 내용이 표시됩니다.")
+        splitter.addWidget(self.preview)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        layout.addWidget(splitter, 1)
+
+        # ── 버튼 바 ───────────────────────────────────────────────
+        btn_row = QHBoxLayout()
+
+        btn_add = QPushButton("Add Note")
+        btn_add.clicked.connect(self._add_note)
+        btn_row.addWidget(btn_add)
+
+        self.btn_edit = QPushButton("Edit")
+        self.btn_edit.clicked.connect(self._edit_note)
+        self.btn_edit.setEnabled(False)
+        btn_row.addWidget(self.btn_edit)
+
+        self.btn_del = QPushButton("Delete")
+        self.btn_del.clicked.connect(self._delete_note)
+        self.btn_del.setEnabled(False)
+        btn_row.addWidget(self.btn_del)
+
+        btn_row.addStretch()
+
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(self.accept)
+        btn_row.addWidget(btn_close)
+
+        layout.addLayout(btn_row)
+
+    # ── 데이터 ────────────────────────────────────────────────────
+
+    def _load_notes(self):
+        self.list_widget.clear()
+        self._note_ids.clear()
+        self.preview.clear()
+
+        try:
+            with db_manager.session_scope() as session:
+                notes = get_notes_by_sample(session, self.sample_id)
+                for note in notes:
+                    # 목록 항목: 날짜 + 첫 줄 미리보기
+                    date_str = note.created_at.strftime("%Y-%m-%d %H:%M") if note.created_at else ""
+                    first_line = note.note_text.splitlines()[0][:60] if note.note_text else ""
+                    if len(note.note_text or "") > 60 or "\n" in (note.note_text or ""):
+                        first_line += " …"
+                    self.list_widget.addItem(f"[{date_str}]  {first_line}")
+                    self._note_ids.append((note.id, note.note_text))
+        except Exception as e:
+            logger.error(f"Note load failed: {e}")
+
+        has = self.list_widget.count() > 0
+        self.btn_edit.setEnabled(False)
+        self.btn_del.setEnabled(False)
+
+    def _on_row_changed(self, row: int):
+        if row < 0 or row >= len(self._note_ids):
+            self.preview.clear()
+            self.btn_edit.setEnabled(False)
+            self.btn_del.setEnabled(False)
+            return
+        _, text = self._note_ids[row]
+        self.preview.setPlainText(text)
+        self.btn_edit.setEnabled(True)
+        self.btn_del.setEnabled(True)
+
+    # ── 동작 ─────────────────────────────────────────────────────
+
+    def _add_note(self):
+        text, ok = self._input_dialog("Add Note", "")
+        if not ok or not text.strip():
+            return
+        try:
+            with db_manager.session_scope() as session:
+                add_note(session, self.sample_id, text.strip())
+            self._load_notes()
+            # 방금 추가한 항목(최신순 0번)으로 선택 이동
+            self.list_widget.setCurrentRow(0)
+        except Exception as e:
+            logger.error(f"Note add failed: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to add note:\n{e}")
+
+    def _edit_note(self):
+        row = self.list_widget.currentRow()
+        if row < 0 or row >= len(self._note_ids):
+            return
+        note_id, current_text = self._note_ids[row]
+        text, ok = self._input_dialog("Edit Note", current_text)
+        if not ok or not text.strip():
+            return
+        try:
+            with db_manager.session_scope() as session:
+                update_note(session, note_id, text.strip())
+            self._load_notes()
+            self.list_widget.setCurrentRow(row)
+        except Exception as e:
+            logger.error(f"Note edit failed: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to edit note:\n{e}")
+
+    def _delete_note(self):
+        row = self.list_widget.currentRow()
+        if row < 0 or row >= len(self._note_ids):
+            return
+        note_id, _ = self._note_ids[row]
+        reply = QMessageBox.question(
+            self, "Delete Note", "이 메모를 삭제하시겠습니까?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            with db_manager.session_scope() as session:
+                delete_note(session, note_id)
+            self._load_notes()
+        except Exception as e:
+            logger.error(f"Note delete failed: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to delete note:\n{e}")
+
+    @staticmethod
+    def _input_dialog(title: str, initial: str) -> tuple[str, bool]:
+        """여러 줄 텍스트 입력 다이얼로그."""
+        dlg = QDialog()
+        dlg.setWindowTitle(title)
+        dlg.setMinimumSize(440, 220)
+        layout = QVBoxLayout(dlg)
+
+        edit = QTextEdit()
+        edit.setPlaceholderText("메모 내용을 입력하세요…")
+        edit.setPlainText(initial)
+        layout.addWidget(edit)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+
+        if dlg.exec_() == QDialog.Accepted:
+            return edit.toPlainText(), True
+        return "", False

@@ -23,7 +23,7 @@ from database import (
     get_qc_metrics_by_sample, delete_qc_metric, delete_sample,
     get_smear_analyses_by_sample,
 )
-from ui.dialogs import SampleDialog, NanoDropDialog, QubitDialog, FemtoPulseDialog
+from ui.dialogs import SampleDialog, NanoDropDialog, QubitDialog, FemtoPulseDialog, NoteDialog
 from analysis.visualizer import load_electropherogram_traces, qc_visualizer
 
 logger = logging.getLogger(__name__)
@@ -87,6 +87,10 @@ class SampleTab(QWidget):
         btn_electro = QPushButton("Electropherogram")
         btn_electro.clicked.connect(self._open_electropherogram)
         btn_bar.addWidget(btn_electro)
+
+        btn_notes = QPushButton("Notes")
+        btn_notes.clicked.connect(self._open_notes)
+        btn_bar.addWidget(btn_notes)
 
         btn_bar.addStretch()
 
@@ -237,6 +241,10 @@ class SampleTab(QWidget):
         ep_action = QAction("View Electropherogram", self)
         ep_action.triggered.connect(lambda: self._show_electropherogram_for(sample_id))
         menu.addAction(ep_action)
+
+        notes_action = QAction("Notes", self)
+        notes_action.triggered.connect(lambda: NoteDialog(sample_id, self).exec_())
+        menu.addAction(notes_action)
 
         menu.addSeparator()
 
@@ -527,6 +535,13 @@ class SampleTab(QWidget):
             self.refresh_samples()
             if self._selected_sample_id:
                 self._load_qc_details(self._selected_sample_id)
+
+    def _open_notes(self):
+        sample_id = self._get_selected_sample_id()
+        if not sample_id:
+            return
+        dlg = NoteDialog(sample_id, self)
+        dlg.exec_()
 
     def _open_electropherogram(self):
         sample_id = self._get_selected_sample_id()

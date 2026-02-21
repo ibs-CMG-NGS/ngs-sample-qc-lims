@@ -44,6 +44,7 @@ class Sample(Base):
     # Relationships
     qc_metrics = relationship("QCMetric", back_populates="sample", cascade="all, delete-orphan")
     raw_traces = relationship("RawTrace", back_populates="sample", cascade="all, delete-orphan")
+    notes = relationship("SampleNote", back_populates="sample", cascade="all, delete-orphan")
     
     def __repr__(self):
         return f"<Sample(id={self.sample_id}, type={self.sample_type})>"
@@ -177,3 +178,19 @@ class SmearAnalysis(Base):
 
     def __repr__(self):
         return f"<SmearAnalysis(sample={self.sample_id}, range={self.range_text})>"
+
+
+class SampleNote(Base):
+    """샘플별 메모/노트"""
+    __tablename__ = 'sample_notes'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    sample_id = Column(String(100), ForeignKey('samples.sample_id'), nullable=False)
+    note_text = Column(String(2000), nullable=False)
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    sample = relationship("Sample", back_populates="notes")
+
+    def __repr__(self):
+        return f"<SampleNote(sample={self.sample_id}, id={self.id})>"
