@@ -1,7 +1,7 @@
 """
 Database Manager - SQLAlchemy Session 및 DB 연결 관리
 """
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, scoped_session
 from sqlalchemy.pool import StaticPool
 from contextlib import contextmanager
@@ -43,7 +43,10 @@ class DatabaseManager:
             
             # 테이블 생성
             Base.metadata.create_all(self.engine)
-            
+
+            # 스키마 마이그레이션 (기존 DB에 누락된 컬럼 추가)
+            self._run_migrations()
+
             logger.info(f"Database initialized: {self.database_url}")
             return True
             
@@ -51,6 +54,22 @@ class DatabaseManager:
             logger.error(f"Database initialization failed: {e}")
             raise
     
+    def _run_migrations(self):
+        """기존 DB에 누락된 컬럼을 안전하게 추가 (idempotent)."""
+        migrations = [
+            "ALTER TABLE samples ADD COLUMN species VARCHAR(100)",
+            "ALTER TABLE samples ADD COLUMN material VARCHAR(100)",
+        ]
+        with self.engine.connect() as conn:
+            for sql in migrations:
+                try:
+                    conn.execute(text(sql))
+                    conn.commit()
+                    logger.info(f"Migration applied: {sql}")
+                except Exception:
+                    # 컬럼이 이미 존재하면 무시
+                    pass
+
     def get_session(self):
         """새로운 세션 반환"""
         if self.Session is None:
