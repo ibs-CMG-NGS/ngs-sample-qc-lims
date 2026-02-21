@@ -128,6 +128,7 @@ class ReportsTab(QWidget):
 
         # 좌우 스플리터
         splitter = QSplitter(Qt.Horizontal)
+        self.splitter = splitter
 
         # ── 왼쪽: 샘플 선택 목록 ─────────────────────────────────
         left = QWidget()
@@ -570,6 +571,28 @@ class ReportsTab(QWidget):
         except Exception as e:
             logger.error(f"Excel export failed: {e}")
             QMessageBox.critical(self, "Export Error", f"Failed to save Excel:\n{e}")
+
+    # ── GUI 상태 저장/복원 ────────────────────────────────────────────
+
+    def save_gui_state(self, settings):
+        from config.gui_state import save_table_widths, save_splitter, save_combo
+        save_table_widths(settings, "ReportsTab/selTableWidths",     self.sel_table)
+        save_table_widths(settings, "ReportsTab/qcPreviewWidths",    self.qc_preview)
+        save_splitter(settings,     "ReportsTab/splitterState",      self.splitter)
+        save_combo(settings,        "ReportsTab/typeFilter",         self.type_filter)
+        settings.setValue("ReportsTab/searchText", self.search_edit.text())
+
+    def restore_gui_state(self, settings):
+        from config.gui_state import restore_table_widths, restore_splitter, restore_combo
+        restore_table_widths(settings, "ReportsTab/selTableWidths",  self.sel_table)
+        restore_table_widths(settings, "ReportsTab/qcPreviewWidths", self.qc_preview)
+        restore_splitter(settings,     "ReportsTab/splitterState",   self.splitter)
+        self.type_filter.blockSignals(True)
+        restore_combo(settings,        "ReportsTab/typeFilter",      self.type_filter)
+        self.type_filter.blockSignals(False)
+        text = settings.value("ReportsTab/searchText", "")
+        if text:
+            self.search_edit.setText(str(text))
 
 
 # ════════════════════════════════════════════════════════════════════

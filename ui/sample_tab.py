@@ -98,6 +98,7 @@ class SampleTab(QWidget):
 
         # Splitter: top = sample list, bottom = QC details
         splitter = QSplitter(Qt.Vertical)
+        self.splitter = splitter
 
         # --- Top: sample list ---
         top_widget = QWidget()
@@ -574,3 +575,17 @@ class SampleTab(QWidget):
         layout.addWidget(close_btn)
 
         dlg.exec_()
+
+    # ── GUI 상태 저장/복원 ────────────────────────────────────────────
+
+    def save_gui_state(self, settings):
+        from config.gui_state import save_table_widths, save_splitter
+        save_table_widths(settings, "SampleTab/sampleTableWidths", self.sample_table)
+        save_table_widths(settings, "SampleTab/qcTableWidths",     self.qc_table)
+        save_splitter(settings,     "SampleTab/splitterState",     self.splitter)
+
+    def restore_gui_state(self, settings):
+        from config.gui_state import restore_table_widths, restore_splitter
+        restore_table_widths(settings, "SampleTab/sampleTableWidths", self.sample_table)
+        restore_table_widths(settings, "SampleTab/qcTableWidths",     self.qc_table)
+        restore_splitter(settings,     "SampleTab/splitterState",     self.splitter)

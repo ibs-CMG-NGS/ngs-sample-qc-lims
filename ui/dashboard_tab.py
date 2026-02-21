@@ -358,3 +358,13 @@ class DashboardTab(QWidget):
         f = QFont()
         f.setBold(True)
         return f
+
+    # ── GUI 상태 저장/복원 ────────────────────────────────────────────
+
+    def save_gui_state(self, settings):
+        from config.gui_state import save_table_widths
+        save_table_widths(settings, "DashboardTab/recentTableWidths", self._recent_table)
+
+    def restore_gui_state(self, settings):
+        from config.gui_state import restore_table_widths
+        restore_table_widths(settings, "DashboardTab/recentTableWidths", self._recent_table)

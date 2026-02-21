@@ -584,3 +584,27 @@ class AnalysisTab(QWidget):
         ax.legend(fontsize=7, loc="upper right", framealpha=0.8)
 
         panel._draw()
+
+    # ── GUI 상태 저장/복원 ────────────────────────────────────────────
+
+    def save_gui_state(self, settings):
+        from config.gui_state import save_combo
+        save_combo(settings, "AnalysisTab/typeCombo",  self.type_combo)
+        save_combo(settings, "AnalysisTab/p1Step",     self._p1_step)
+        save_combo(settings, "AnalysisTab/p1Metric",   self._p1_metric)
+        save_combo(settings, "AnalysisTab/p2Mode",     self._p2_mode)
+        save_combo(settings, "AnalysisTab/p3Metric",   self._p3_metric)
+
+    def restore_gui_state(self, settings):
+        from config.gui_state import restore_combo
+        # 콤보 복원 시 차트 재그리기를 방지하기 위해 시그널 임시 차단
+        for combo, key in [
+            (self.type_combo,  "AnalysisTab/typeCombo"),
+            (self._p1_step,    "AnalysisTab/p1Step"),
+            (self._p1_metric,  "AnalysisTab/p1Metric"),
+            (self._p2_mode,    "AnalysisTab/p2Mode"),
+            (self._p3_metric,  "AnalysisTab/p3Metric"),
+        ]:
+            combo.blockSignals(True)
+            restore_combo(settings, key, combo)
+            combo.blockSignals(False)

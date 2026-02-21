@@ -158,6 +158,51 @@ class MainWindow(QMainWindow):
                 "Database Error",
                 f"Failed to initialize database:\n{str(e)}"
             )
+        # DB 초기화 후 GUI 상태 복원
+        self._restore_gui_state()
+
+    # ── GUI 상태 저장/복원 ────────────────────────────────────────────
+
+    def _save_gui_state(self):
+        """종료 시 모든 GUI 상태를 settings 파일에 저장."""
+        from config.gui_state import get_settings
+        s = get_settings()
+        s.setValue("MainWindow/geometry",   self.saveGeometry())
+        s.setValue("MainWindow/windowState", self.saveState())
+        s.setValue("MainWindow/currentTab", self.tabs.currentIndex())
+        self.sample_tab.save_gui_state(s)
+        self.dashboard_tab.save_gui_state(s)
+        self.analysis_tab.save_gui_state(s)
+        self.reports_tab.save_gui_state(s)
+        s.sync()
+        logger.info("GUI state saved")
+
+    def _restore_gui_state(self):
+        """시작 시 저장된 GUI 상태를 복원."""
+        from config.gui_state import get_settings
+        from PyQt5.QtCore import QByteArray
+        s = get_settings()
+
+        geom = s.value("MainWindow/geometry")
+        if isinstance(geom, QByteArray) and not geom.isEmpty():
+            self.restoreGeometry(geom)
+
+        state = s.value("MainWindow/windowState")
+        if isinstance(state, QByteArray) and not state.isEmpty():
+            self.restoreState(state)
+
+        tab_idx = s.value("MainWindow/currentTab")
+        if tab_idx is not None:
+            try:
+                self.tabs.setCurrentIndex(int(tab_idx))
+            except (ValueError, TypeError):
+                pass
+
+        self.sample_tab.restore_gui_state(s)
+        self.dashboard_tab.restore_gui_state(s)
+        self.analysis_tab.restore_gui_state(s)
+        self.reports_tab.restore_gui_state(s)
+        logger.info("GUI state restored")
     
     def _on_tab_changed(self, index: int):
         """탭 전환 시 자동 새로고침."""
@@ -217,7 +262,7 @@ class MainWindow(QMainWindow):
         )
         
         if reply == QMessageBox.Yes:
-            # 데이터베이스 연결 종료
+            self._save_gui_state()
             self.db_manager.close()
             event.accept()
         else:
