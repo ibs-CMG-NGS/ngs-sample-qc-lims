@@ -115,3 +115,6 @@ coverage.xml
 tmp/
 temp/
 *.tmp
+
+# GUI state (user-specific, should not be shared)
+config/gui_state.ini
