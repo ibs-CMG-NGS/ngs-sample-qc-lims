@@ -16,6 +16,7 @@ from database import db_manager
 from ui.sample_tab import SampleTab
 from ui.dashboard_tab import DashboardTab
 from ui.reports_tab import ReportsTab
+from ui.analysis_tab import AnalysisTab
 
 logger = logging.getLogger(__name__)
 
@@ -71,11 +72,8 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.sample_tab, "🧬 Samples")
         
         # QC Analysis 탭
-        analysis_tab = QWidget()
-        analysis_layout = QVBoxLayout()
-        analysis_layout.addWidget(QLabel("QC Analysis - Coming Soon"))
-        analysis_tab.setLayout(analysis_layout)
-        self.tabs.addTab(analysis_tab, "📈 Analysis")
+        self.analysis_tab = AnalysisTab()
+        self.tabs.addTab(self.analysis_tab, "📈 Analysis")
 
         # Reports 탭
         self.reports_tab = ReportsTab()
@@ -166,6 +164,8 @@ class MainWindow(QMainWindow):
         widget = self.tabs.widget(index)
         if widget is self.dashboard_tab:
             self.dashboard_tab.refresh()
+        elif widget is self.analysis_tab:
+            self.analysis_tab.refresh()
         elif widget is self.reports_tab:
             self.reports_tab.refresh()
 
