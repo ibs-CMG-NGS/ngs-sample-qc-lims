@@ -14,6 +14,7 @@ import logging
 from config.settings import WINDOW_TITLE, WINDOW_WIDTH, WINDOW_HEIGHT
 from database import db_manager
 from ui.sample_tab import SampleTab
+from ui.dashboard_tab import DashboardTab
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,7 @@ class MainWindow(QMainWindow):
         
         # 탭 위젯 생성
         self.tabs = QTabWidget()
+        self.tabs.currentChanged.connect(self._on_tab_changed)
         layout.addWidget(self.tabs)
         
         # 탭 추가 (placeholder - 추후 구현)
@@ -60,12 +62,9 @@ class MainWindow(QMainWindow):
     def _create_tabs(self):
         """탭 생성"""
         # Dashboard 탭
-        dashboard_tab = QWidget()
-        dashboard_layout = QVBoxLayout()
-        dashboard_layout.addWidget(QLabel("Dashboard - Coming Soon"))
-        dashboard_tab.setLayout(dashboard_layout)
-        self.tabs.addTab(dashboard_tab, "📊 Dashboard")
-        
+        self.dashboard_tab = DashboardTab()
+        self.tabs.addTab(self.dashboard_tab, "📊 Dashboard")
+
         # Sample Management 탭
         self.sample_tab = SampleTab()
         self.tabs.addTab(self.sample_tab, "🧬 Samples")
@@ -164,6 +163,11 @@ class MainWindow(QMainWindow):
                 f"Failed to initialize database:\n{str(e)}"
             )
     
+    def _on_tab_changed(self, index: int):
+        """탭 전환 시 Dashboard 자동 새로고침."""
+        if self.tabs.widget(index) is self.dashboard_tab:
+            self.dashboard_tab.refresh()
+
     def new_sample(self):
         """새 샘플 등록"""
         self.tabs.setCurrentWidget(self.sample_tab)
