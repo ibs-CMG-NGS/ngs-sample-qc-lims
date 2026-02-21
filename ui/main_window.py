@@ -15,6 +15,7 @@ from config.settings import WINDOW_TITLE, WINDOW_WIDTH, WINDOW_HEIGHT
 from database import db_manager
 from ui.sample_tab import SampleTab
 from ui.dashboard_tab import DashboardTab
+from ui.reports_tab import ReportsTab
 
 logger = logging.getLogger(__name__)
 
@@ -75,13 +76,10 @@ class MainWindow(QMainWindow):
         analysis_layout.addWidget(QLabel("QC Analysis - Coming Soon"))
         analysis_tab.setLayout(analysis_layout)
         self.tabs.addTab(analysis_tab, "📈 Analysis")
-        
+
         # Reports 탭
-        reports_tab = QWidget()
-        reports_layout = QVBoxLayout()
-        reports_layout.addWidget(QLabel("Reports - Coming Soon"))
-        reports_tab.setLayout(reports_layout)
-        self.tabs.addTab(reports_tab, "📄 Reports")
+        self.reports_tab = ReportsTab()
+        self.tabs.addTab(self.reports_tab, "📄 Reports")
     
     def _create_menu_bar(self):
         """메뉴바 생성"""
@@ -164,9 +162,12 @@ class MainWindow(QMainWindow):
             )
     
     def _on_tab_changed(self, index: int):
-        """탭 전환 시 Dashboard 자동 새로고침."""
-        if self.tabs.widget(index) is self.dashboard_tab:
+        """탭 전환 시 자동 새로고침."""
+        widget = self.tabs.widget(index)
+        if widget is self.dashboard_tab:
             self.dashboard_tab.refresh()
+        elif widget is self.reports_tab:
+            self.reports_tab.refresh()
 
     def new_sample(self):
         """새 샘플 등록"""
