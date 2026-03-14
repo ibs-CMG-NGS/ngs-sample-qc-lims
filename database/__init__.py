@@ -1,7 +1,7 @@
 """Database package initialization"""
 from database.models import (
     Base, Sample, QCMetric, RawTrace, ExperimentBatch,
-    FemtoPulseRun, SmearAnalysis, SampleNote,
+    FemtoPulseRun, SmearAnalysis, SampleNote, Project,
 )
 from database.db_manager import (
     DatabaseManager,
@@ -26,6 +26,10 @@ from database.db_manager import (
     get_notes_by_sample,
     update_note,
     delete_note,
+    get_all_projects,
+    get_project_by_name,
+    add_project,
+    update_project,
 )
 
 __all__ = [
@@ -59,4 +63,9 @@ __all__ = [
     'get_notes_by_sample',
     'update_note',
     'delete_note',
+    'Project',
+    'get_all_projects',
+    'get_project_by_name',
+    'add_project',
+    'update_project',
 ]

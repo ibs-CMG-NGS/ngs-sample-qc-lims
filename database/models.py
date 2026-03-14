@@ -36,6 +36,8 @@ class Sample(Base):
     sample_type = Column(String(50), nullable=False)  # WGS, mRNA-seq, etc.
     species = Column(String(100))  # Human, Mouse, Rat, etc.
     material = Column(String(100))  # Blood, Tissue, Cultured Cell, FFPE, Saliva
+    full_name = Column(String(200))  # Optional – 고객사 제공 명칭 등
+    project = Column(String(200))    # Project name
     source = Column(String(200))
     description = Column(String(500))
     created_at = Column(DateTime, default=datetime.now)
@@ -78,6 +80,9 @@ class QCMetric(Base):
     # Status
     status = Column(String(20))  # Pass, Warning, Fail
     
+    # Library index (e.g. A04, H03) — Library Prep 단계에서 사용
+    index_no = Column(String(50))
+
     # Instrument and file info
     instrument = Column(String(50))  # NanoDrop, Qubit, Femto Pulse
     data_file = Column(String(500))  # Original data file path
@@ -146,6 +151,7 @@ class FemtoPulseRun(Base):
     size_calibration_path = Column(String(500))
     smear_analysis_path = Column(String(500))
 
+    measured_at = Column(DateTime)   # 실험자가 선택한 측정 날짜
     created_at = Column(DateTime, default=datetime.now)
 
     smear_analyses = relationship("SmearAnalysis", back_populates="run", cascade="all, delete-orphan")
@@ -178,6 +184,22 @@ class SmearAnalysis(Base):
 
     def __repr__(self):
         return f"<SmearAnalysis(sample={self.sample_id}, range={self.range_text})>"
+
+
+class Project(Base):
+    """프로젝트 — species/material/sample_type 등 공통 속성 저장"""
+    __tablename__ = 'projects'
+
+    id           = Column(Integer, primary_key=True, autoincrement=True)
+    project_name = Column(String(200), unique=True, nullable=False, index=True)
+    species      = Column(String(100))
+    material     = Column(String(100))
+    sample_type  = Column(String(50))   # WGS, mRNA-seq, 등
+    description  = Column(String(500))
+    created_at   = Column(DateTime, default=datetime.now)
+
+    def __repr__(self):
+        return f"<Project(name={self.project_name})>"
 
 
 class SampleNote(Base):

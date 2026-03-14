@@ -46,6 +46,8 @@ class DatabaseManager:
 
             # 스키마 마이그레이션 (기존 DB에 누락된 컬럼 추가)
             self._run_migrations()
+            # 기존 프로젝트명을 projects 테이블로 seed
+            self._seed_projects_from_samples()
 
             logger.info(f"Database initialized: {self.database_url}")
             return True
@@ -59,6 +61,10 @@ class DatabaseManager:
         migrations = [
             "ALTER TABLE samples ADD COLUMN species VARCHAR(100)",
             "ALTER TABLE samples ADD COLUMN material VARCHAR(100)",
+            "ALTER TABLE samples ADD COLUMN full_name VARCHAR(200)",
+            "ALTER TABLE samples ADD COLUMN project VARCHAR(200)",
+            "ALTER TABLE femtopulse_runs ADD COLUMN measured_at DATETIME",
+            "ALTER TABLE qc_metrics ADD COLUMN index_no VARCHAR(50)",
         ]
         with self.engine.connect() as conn:
             for sql in migrations:
@@ -69,6 +75,32 @@ class DatabaseManager:
                 except Exception:
                     # 컬럼이 이미 존재하면 무시
                     pass
+
+    def _seed_projects_from_samples(self):
+        """samples 테이블의 distinct project 값을 projects 테이블로 마이그레이션 (idempotent)."""
+        from database.models import Project
+        try:
+            with self.engine.connect() as conn:
+                rows = conn.execute(
+                    text("SELECT DISTINCT project FROM samples WHERE project IS NOT NULL AND project != ''")
+                ).fetchall()
+            if not rows:
+                return
+            session = self.session_factory()
+            try:
+                for (name,) in rows:
+                    exists = session.query(Project).filter(Project.project_name == name).first()
+                    if not exists:
+                        session.add(Project(project_name=name))
+                session.commit()
+                logger.info(f"Seeded {len(rows)} project(s) from samples table")
+            except Exception as e:
+                session.rollback()
+                logger.warning(f"Project seed failed: {e}")
+            finally:
+                session.close()
+        except Exception as e:
+            logger.warning(f"Project seed skipped: {e}")
 
     def get_session(self):
         """새로운 세션 반환"""
@@ -327,3 +359,38 @@ def delete_note(session, note_id: int):
         session.delete(note)
         session.flush()
     return note is not None
+
+
+# ── Project CRUD ───────────────────────────────────────────────────
+
+def get_all_projects(session):
+    """모든 프로젝트 조회 (이름 순)"""
+    from database.models import Project
+    return session.query(Project).order_by(Project.project_name).all()
+
+
+def get_project_by_name(session, name: str):
+    """프로젝트 이름으로 조회"""
+    from database.models import Project
+    return session.query(Project).filter(Project.project_name == name).first()
+
+
+def add_project(session, data: dict):
+    """프로젝트 추가"""
+    from database.models import Project
+    proj = Project(**data)
+    session.add(proj)
+    session.flush()
+    return proj
+
+
+def update_project(session, project_name: str, data: dict):
+    """프로젝트 수정"""
+    proj = get_project_by_name(session, project_name)
+    if not proj:
+        return None
+    for key, value in data.items():
+        if hasattr(proj, key):
+            setattr(proj, key, value)
+    session.flush()
+    return proj
