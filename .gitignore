@@ -118,3 +118,6 @@ temp/
 
 # GUI state (user-specific, should not be shared)
 config/gui_state.ini
+
+# Local settings (API keys, credentials paths — never commit)
+config/settings.local.json

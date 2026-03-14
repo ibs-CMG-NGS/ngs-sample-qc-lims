@@ -72,23 +72,49 @@ class QCJudge:
         return "Pass"
     
     def _judge_mrna(self, qc_data: Dict) -> str:
-        """mRNA-seq 샘플 판정"""
-        rin = qc_data.get('gqn_rin')
-        
-        if rin is None:
-            return "Pending"
-        
+        """mRNA-seq 샘플 판정 (RIN + 순도 + 농도)"""
         criteria = self.criteria.get('mRNA-seq', {})
-        rin_criteria = criteria.get('RIN', {})
-        rin_pass = rin_criteria.get('pass', 8.0)
-        rin_warning = rin_criteria.get('warning', 6.0)
-        
-        if rin < rin_warning:
-            return "Fail"
-        elif rin < rin_pass:
-            return "Warning"
-        else:
-            return "Pass"
+        status = "Pass"
+
+        def _downgrade(current, new):
+            order = {"Pass": 0, "Warning": 1, "Fail": 2, "Pending": -1}
+            return new if order.get(new, 0) > order.get(current, 0) else current
+
+        rin = qc_data.get('gqn_rin')
+        if rin is not None:
+            rin_c = criteria.get('RIN', {})
+            if rin < rin_c.get('warning', 6.0):
+                status = _downgrade(status, "Fail")
+            elif rin < rin_c.get('pass', 8.0):
+                status = _downgrade(status, "Warning")
+
+        p280 = qc_data.get('purity_260_280')
+        if p280 is not None:
+            p_c = criteria.get('purity_260_280', {})
+            if p280 < p_c.get('warning', 1.8):
+                status = _downgrade(status, "Fail")
+            elif p280 < p_c.get('pass', 2.0):
+                status = _downgrade(status, "Warning")
+
+        p230 = qc_data.get('purity_260_230')
+        if p230 is not None:
+            p_c = criteria.get('purity_260_230', {})
+            if p230 < p_c.get('warning', 1.5):
+                status = _downgrade(status, "Fail")
+            elif p230 < p_c.get('pass', 1.8):
+                status = _downgrade(status, "Warning")
+
+        conc = qc_data.get('concentration')
+        if conc is not None:
+            conc_warn = criteria.get('concentration', {}).get('warning', 5.0)
+            if conc < conc_warn:
+                status = _downgrade(status, "Warning")
+
+        # 측정값이 하나도 없으면 Pending
+        if rin is None and p280 is None and p230 is None and conc is None:
+            return "Pending"
+
+        return status
     
     def _judge_generic(self, qc_data: Dict) -> str:
         """일반 샘플 판정 (농도 기준)"""
@@ -142,15 +168,45 @@ class QCJudge:
                 suggestions.append("May need to concentrate sample or adjust input amount.")
         
         elif sample_type == "mRNA-seq":
+            criteria = self.criteria.get('mRNA-seq', {})
             rin = qc_data.get('gqn_rin')
-            
+            p280 = qc_data.get('purity_260_280')
+            p230 = qc_data.get('purity_260_230')
+            conc = qc_data.get('concentration')
+
             if rin is not None:
-                if rin < 6.0:
-                    reasons.append(f"RIN too low: {rin:.1f} (< 6.0)")
+                rin_warn = criteria.get('RIN', {}).get('warning', 6.0)
+                rin_pass = criteria.get('RIN', {}).get('pass', 8.0)
+                if rin < rin_warn:
+                    reasons.append(f"RIN too low: {rin:.1f} (< {rin_warn})")
                     suggestions.append("RNA is degraded. Not suitable for mRNA-seq.")
-                elif rin < 8.0:
-                    reasons.append(f"RIN suboptimal: {rin:.1f} (< 8.0)")
+                elif rin < rin_pass:
+                    reasons.append(f"RIN suboptimal: {rin:.1f} (< {rin_pass})")
                     suggestions.append("Can proceed but expect reduced library complexity.")
+
+            if p280 is not None:
+                p_warn = criteria.get('purity_260_280', {}).get('warning', 1.8)
+                p_pass = criteria.get('purity_260_280', {}).get('pass', 2.0)
+                if p280 < p_warn:
+                    reasons.append(f"260/280 too low: {p280:.2f} (< {p_warn})")
+                    suggestions.append("RNA purity insufficient. Check for protein contamination.")
+                elif p280 < p_pass:
+                    reasons.append(f"260/280 suboptimal: {p280:.2f} (< {p_pass})")
+
+            if p230 is not None:
+                p_warn = criteria.get('purity_260_230', {}).get('warning', 1.5)
+                p_pass = criteria.get('purity_260_230', {}).get('pass', 1.8)
+                if p230 < p_warn:
+                    reasons.append(f"260/230 too low: {p230:.2f} (< {p_warn})")
+                    suggestions.append("Possible salt/solvent contamination. Consider re-purification.")
+                elif p230 < p_pass:
+                    reasons.append(f"260/230 suboptimal: {p230:.2f} (< {p_pass})")
+
+            if conc is not None:
+                conc_warn = criteria.get('concentration', {}).get('warning', 5.0)
+                if conc < conc_warn:
+                    reasons.append(f"Low concentration: {conc:.2f} ng/µl (< {conc_warn})")
+                    suggestions.append("Consider concentrating the sample before proceeding.")
         
         return {
             'status': status,

@@ -35,7 +35,9 @@ try:
 except ImportError:
     HAS_MPL = False
 
-from config.settings import QC_STEPS, QC_CRITERIA, STATUS_COLORS
+from config.settings import QC_STEPS, RNA_QC_STEPS, QC_CRITERIA, STATUS_COLORS
+
+_ALL_STEPS = QC_STEPS + RNA_QC_STEPS
 from database import db_manager, get_all_samples, get_qc_metrics_by_sample
 
 logger = logging.getLogger(__name__)
@@ -58,7 +60,6 @@ METRICS = {
     "Total Amount (ng)":     "total_amount",
     "GQN / RIN":             "gqn_rin",
     "Avg Size (bp)":         "avg_size",
-    "Molarity (nM)":         "molarity",
     "Purity 260/280":        "purity_260_280",
 }
 
@@ -164,6 +165,12 @@ class AnalysisTab(QWidget):
         self.type_combo.currentIndexChanged.connect(self._on_filter_changed)
         hdr.addWidget(self.type_combo)
 
+        hdr.addWidget(QLabel("Project:"))
+        self._proj_combo = QComboBox()
+        self._proj_combo.addItem("All Projects")
+        self._proj_combo.currentIndexChanged.connect(self._on_filter_changed)
+        hdr.addWidget(self._proj_combo)
+
         hdr.addStretch()
 
         btn_refresh = QPushButton("Refresh")
@@ -182,7 +189,7 @@ class AnalysisTab(QWidget):
 
         # 1) 배치 비교
         self._panel1 = _ChartPanel("① 배치 비교 — 샘플 간 지표 비교")
-        self._p1_step   = self._add_combo(self._panel1, "단계:", QC_STEPS)
+        self._p1_step   = self._add_combo(self._panel1, "단계:", _ALL_STEPS)
         self._p1_metric = self._add_combo(self._panel1, "지표:", list(METRICS.keys()))
         self._p1_step.currentIndexChanged.connect(self._draw_chart1)
         self._p1_metric.currentIndexChanged.connect(self._draw_chart1)
@@ -238,6 +245,7 @@ class AnalysisTab(QWidget):
                         "sample_id":   s.sample_id,
                         "sample_name": s.sample_name or "",
                         "sample_type": s.sample_type or "",
+                        "project":     getattr(s, 'project', None) or "",
                         "metrics": [
                             {
                                 "step":           m.step,
@@ -246,7 +254,6 @@ class AnalysisTab(QWidget):
                                 "total_amount":   m.total_amount,
                                 "gqn_rin":        m.gqn_rin,
                                 "avg_size":       m.avg_size,
-                                "molarity":       m.molarity,
                                 "purity_260_280": m.purity_260_280,
                                 "status":         m.status,
                                 "measured_at":    m.measured_at,
@@ -270,13 +277,45 @@ class AnalysisTab(QWidget):
         self.type_combo.setCurrentIndex(max(idx, 0))
         self.type_combo.blockSignals(False)
 
+        # 프로젝트 필터 콤보 갱신
+        projects = sorted({d["project"] for d in self._data if d["project"]})
+        self._proj_combo.blockSignals(True)
+        prev_proj = self._proj_combo.currentText()
+        self._proj_combo.clear()
+        self._proj_combo.addItem("All Projects")
+        for p in projects:
+            self._proj_combo.addItem(p)
+        proj_idx = self._proj_combo.findText(prev_proj)
+        self._proj_combo.setCurrentIndex(max(proj_idx, 0))
+        self._proj_combo.blockSignals(False)
+
         self._draw_all()
 
+    def _get_thresholds(self, metric: str) -> List[tuple]:
+        """현재 선택된 샘플 타입에 맞는 QC 기준선 반환."""
+        if metric != "gqn_rin":
+            return _THRESHOLDS.get(metric, [])
+        stype = self.type_combo.currentText()
+        if stype == "mRNA-seq":
+            return [
+                (8.0, "Pass", _STATUS_COLOR["Pass"]),
+                (6.0, "Warning", _STATUS_COLOR["Warning"]),
+            ]
+        # WGS 또는 All Types → DNA 기준
+        return [
+            (7.0, "Pass", _STATUS_COLOR["Pass"]),
+            (5.0, "Warning", _STATUS_COLOR["Warning"]),
+        ]
+
     def _filtered_data(self) -> List[dict]:
-        t = self.type_combo.currentText()
-        if t == "All Types":
-            return self._data
-        return [d for d in self._data if d["sample_type"] == t]
+        data = self._data
+        stype = self.type_combo.currentText()
+        proj = self._proj_combo.currentText()
+        if stype != "All Types":
+            data = [d for d in data if d["sample_type"] == stype]
+        if proj != "All Projects":
+            data = [d for d in data if d["project"] == proj]
+        return data
 
     def _on_filter_changed(self):
         self._draw_all()
@@ -330,7 +369,7 @@ class AnalysisTab(QWidget):
                     f"{val:.1f}", ha="center", va="bottom", fontsize=8)
 
         # QC 기준선
-        for thresh_val, thresh_label, thresh_color in _THRESHOLDS.get(metric, []):
+        for thresh_val, thresh_label, thresh_color in self._get_thresholds(metric):
             ax.axhline(thresh_val, color=thresh_color, linestyle="--",
                        linewidth=1.2, alpha=0.8, label=f"{thresh_label} ({thresh_val})")
             ax.legend(fontsize=7, loc="upper right", framealpha=0.8)
@@ -372,12 +411,12 @@ class AnalysisTab(QWidget):
             # 단계 순서에 따라 total_amount 정렬
             step_vals: Dict[str, float] = {}
             for m in d["metrics"]:
-                if m["total_amount"] is not None and m["step"] in QC_STEPS:
+                if m["total_amount"] is not None and m["step"] in _ALL_STEPS:
                     # 같은 step에 여러 기록이 있으면 마지막 Qubit 우선
                     if m["step"] not in step_vals or m["instrument"] == "Qubit":
                         step_vals[m["step"]] = m["total_amount"]
 
-            ordered_steps = [s for s in QC_STEPS if s in step_vals]
+            ordered_steps = [s for s in _ALL_STEPS if s in step_vals]
             if len(ordered_steps) < 2:
                 continue
 
@@ -405,11 +444,11 @@ class AnalysisTab(QWidget):
             panel._no_data("Total Amount 데이터 없음\n(Qubit 측정값 2단계 이상 필요)")
             return
 
-        # x축은 QC_STEPS 전체 기준
+        # x축은 _ALL_STEPS 전체 기준
         all_steps_present = sorted(
-            {s for d in data for m in d["metrics"] if m["step"] in QC_STEPS
+            {s for d in data for m in d["metrics"] if m["step"] in _ALL_STEPS
              for s in [m["step"]]},
-            key=lambda s: QC_STEPS.index(s)
+            key=lambda s: _ALL_STEPS.index(s)
         )
         ax.set_xticks(np.arange(len(all_steps_present)))
         ax.set_xticklabels(all_steps_present, rotation=18, ha="right", fontsize=8)
@@ -478,7 +517,7 @@ class AnalysisTab(QWidget):
                         edgecolor="white", linewidth=0.5, label=label_s)
 
         # QC 기준선
-        for thresh_val, thresh_label, thresh_color in _THRESHOLDS.get(metric, []):
+        for thresh_val, thresh_label, thresh_color in self._get_thresholds(metric):
             ax.axvline(thresh_val, color=thresh_color, linestyle="--",
                        linewidth=1.5, alpha=0.9,
                        label=f"{thresh_label} threshold ({thresh_val})")
@@ -514,7 +553,7 @@ class AnalysisTab(QWidget):
         # 단계별로 상태 카운트
         step_counts: Dict[str, Dict[str, int]] = {
             step: {"Pass": 0, "Warning": 0, "Fail": 0, "No Status": 0}
-            for step in QC_STEPS
+            for step in _ALL_STEPS
         }
 
         for d in data:
@@ -534,7 +573,7 @@ class AnalysisTab(QWidget):
                 step_counts[step][status] += 1
 
         # 데이터가 있는 단계만 표시
-        active_steps = [s for s in QC_STEPS
+        active_steps = [s for s in _ALL_STEPS
                         if sum(step_counts[s].values()) > 0]
         if not active_steps:
             panel._no_data("QC 상태 데이터 없음\n(NanoDrop/Qubit 측정 후 표시됩니다)")
@@ -590,6 +629,7 @@ class AnalysisTab(QWidget):
     def save_gui_state(self, settings):
         from config.gui_state import save_combo
         save_combo(settings, "AnalysisTab/typeCombo",  self.type_combo)
+        save_combo(settings, "AnalysisTab/projCombo",  self._proj_combo)
         save_combo(settings, "AnalysisTab/p1Step",     self._p1_step)
         save_combo(settings, "AnalysisTab/p1Metric",   self._p1_metric)
         save_combo(settings, "AnalysisTab/p2Mode",     self._p2_mode)
@@ -600,6 +640,7 @@ class AnalysisTab(QWidget):
         # 콤보 복원 시 차트 재그리기를 방지하기 위해 시그널 임시 차단
         for combo, key in [
             (self.type_combo,  "AnalysisTab/typeCombo"),
+            (self._proj_combo, "AnalysisTab/projCombo"),
             (self._p1_step,    "AnalysisTab/p1Step"),
             (self._p1_metric,  "AnalysisTab/p1Metric"),
             (self._p2_mode,    "AnalysisTab/p2Mode"),

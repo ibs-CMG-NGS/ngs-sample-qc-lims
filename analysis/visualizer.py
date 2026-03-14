@@ -218,16 +218,22 @@ class QCVisualizer:
         self,
         sample_id: str,
         traces: List[Dict],
-        ladder_points: Optional[List[float]] = None,
+        calibration: Optional[List[Dict]] = None,
         save_path: Optional[str] = None,
     ) -> Optional[plt.Figure]:
         """Electropherogram step-overlay for a single sample.
 
+        X-axis is migration time (seconds), following the raw Femto Pulse output.
+        Tick positions are placed at ladder marker times from Size Calibration,
+        and labeled with their corresponding base-pair sizes — matching the
+        Femto Pulse ProAnalysis display style.
+
         Args:
-            sample_id: Sample ID
-            traces: [{'step': str, 'size_bp': ndarray, 'rfu': ndarray}, ...]
-            ladder_points: Ladder Size(bp) values from Size Calibration for x-ticks
-            save_path: Optional save path
+            sample_id:   Sample ID (used for plot title)
+            traces:      [{'step': str, 'time_sec': ndarray, 'rfu': ndarray}, ...]
+            calibration: [{'time_sec': float, 'ladder_size_bp': float}, ...]
+                         from parse_size_calibration(). Drives tick placement.
+            save_path:   Optional file path to save the figure.
 
         Returns:
             matplotlib Figure or None
@@ -238,40 +244,70 @@ class QCVisualizer:
 
         fig, ax = plt.subplots(figsize=self.figsize, dpi=self.dpi)
 
-        colors = plt.cm.tab10(np.linspace(0, 1, max(len(traces), 1)))
+        n = max(len(traces), 1)
+        cmap = plt.cm.tab20 if n > 10 else plt.cm.tab10
+        colors = cmap(np.linspace(0, 1, n))
+
+        # Build bp→time conversion from calibration (sorted by bp for np.interp).
+        # Electropherogram X values are in bp; we convert to migration time so the
+        # visual spacing matches Femto Pulse ProAnalysis (non-linear, like log-scale).
+        cal_bps_arr = cal_times_arr = None
+        tick_times: List[float] = []
+        tick_bp_labels: List[float] = []
+        if calibration:
+            pts = sorted(
+                [(c['ladder_size_bp'], c['time_sec']) for c in calibration
+                 if c.get('ladder_size_bp') is not None and c.get('time_sec') is not None],
+                key=lambda p: p[0]   # sort by bp for np.interp
+            )
+            if pts:
+                cal_bps_arr   = np.array([p[0] for p in pts])
+                cal_times_arr = np.array([p[1] for p in pts])
+                tick_times     = list(cal_times_arr)
+                tick_bp_labels = [p[0] for p in pts]
 
         for i, trace in enumerate(traces):
             step = trace.get('step', f'Step {i + 1}')
-            size_bp = trace.get('size_bp', [])
+            x_bp = trace.get('time_sec') if trace.get('time_sec') is not None else trace.get('size_bp', [])
             rfu = trace.get('rfu', [])
 
-            if len(size_bp) > 0 and len(rfu) > 0:
-                ax.plot(size_bp, rfu, label=step, color=colors[i], linewidth=1.5)
-
-        ax.set_xscale('log')
-
-        # Ladder points as x-axis ticks
-        if ladder_points:
-            from matplotlib.ticker import FixedLocator, FixedFormatter
-            ticks = sorted([p for p in ladder_points if p > 0])
-            ax.xaxis.set_major_locator(FixedLocator(ticks))
-            labels = []
-            for v in ticks:
-                if v >= 1000:
-                    labels.append(f'{int(v):,}')
+            if len(x_bp) > 0 and len(rfu) > 0:
+                if cal_bps_arr is not None:
+                    # Convert bp → migration time for ProAnalysis-style non-linear spacing
+                    x = np.interp(x_bp, cal_bps_arr, cal_times_arr)
                 else:
-                    labels.append(str(int(v)))
-            ax.xaxis.set_major_formatter(FixedFormatter(labels))
-            ax.xaxis.set_minor_locator(FixedLocator([]))  # no minor ticks
-            ax.tick_params(axis='x', rotation=45, labelsize=9)
-            # Set x-range to ladder extent with some margin
-            ax.set_xlim(min(ticks) * 0.5, max(ticks) * 2.5)
+                    x = np.asarray(x_bp, dtype=float)
+                ax.plot(x, rfu, label=step, color=colors[i], linewidth=1.5)
 
-        ax.set_xlabel('Size (bp)', fontsize=12, fontweight='bold')
+        # Ticks at calibration migration-time positions, labeled with bp sizes
+        if tick_times:
+            from matplotlib.ticker import FixedLocator, FixedFormatter
+            ax.xaxis.set_major_locator(FixedLocator(tick_times))
+            labels = [
+                f'{int(bp):,}' if bp >= 1000 else str(int(bp))
+                for bp in tick_bp_labels
+            ]
+            ax.xaxis.set_major_formatter(FixedFormatter(labels))
+            ax.xaxis.set_minor_locator(FixedLocator([]))
+            ax.tick_params(axis='x', rotation=45, labelsize=9)
+
+            # Light vertical reference lines at each ladder marker
+            for t in tick_times:
+                ax.axvline(t, color='gray', linewidth=0.5,
+                           linestyle='--', alpha=0.35)
+
+            # Clip to calibration time range with small margins
+            span = max(tick_times) - min(tick_times)
+            margin = span * 0.02
+            ax.set_xlim(left=min(tick_times) - margin,
+                        right=max(tick_times) + margin)
+
+        ax.set_xlabel('Size (bp)  [migration time axis, calibrated by ladder]',
+                      fontsize=10, fontweight='bold')
         ax.set_ylabel('RFU', fontsize=12, fontweight='bold')
         ax.set_title(f'Electropherogram: {sample_id}', fontsize=14, fontweight='bold')
         ax.legend(loc='best')
-        ax.grid(alpha=0.3, which='major')
+        ax.grid(axis='y', alpha=0.25)
 
         plt.tight_layout()
 
@@ -286,15 +322,16 @@ def load_electropherogram_traces(sample_id: str) -> tuple:
     """Load electropherogram traces for a sample from DB + on-demand CSV parsing.
 
     Returns:
-        (traces, ladder_points) where
-        traces: [{'step': str, 'size_bp': ndarray, 'rfu': ndarray}, ...]
-        ladder_points: [float, ...] from Size Calibration or empty list
+        (traces, calibration) where
+        traces:      [{'step': str, 'time_sec': ndarray, 'rfu': ndarray}, ...]
+        calibration: [{'time_sec': float, 'ladder_size_bp': float}, ...]
+                     from the Size Calibration file (empty list if unavailable)
     """
     from parsers import parse_electropherogram, parse_size_calibration
     from database.models import FemtoPulseRun
 
     traces = []
-    ladder_points = []
+    calibration: List[Dict] = []
     try:
         with db_manager.session_scope() as session:
             raw_traces = (
@@ -316,8 +353,8 @@ def load_electropherogram_traces(sample_id: str) -> tuple:
                     logger.warning(f"Electropherogram file not found: {rt.raw_file_path}")
                     continue
 
-                # Load ladder points from the FemtoPulseRun that owns this electropherogram
-                if not ladder_points:
+                # Load calibration from the FemtoPulseRun that owns this electropherogram
+                if not calibration:
                     fp_run = (
                         session.query(FemtoPulseRun)
                         .filter(FemtoPulseRun.electropherogram_path == rt.raw_file_path)
@@ -328,16 +365,19 @@ def load_electropherogram_traces(sample_id: str) -> tuple:
                         if Path(cal_path).exists():
                             try:
                                 cal_data = parse_size_calibration(cal_path)
-                                ladder_points = [
-                                    r['ladder_size_bp'] for r in cal_data
-                                    if r.get('ladder_size_bp') is not None
+                                calibration = [
+                                    {'time_sec': r['time_sec'],
+                                     'ladder_size_bp': r['ladder_size_bp']}
+                                    for r in cal_data
+                                    if r.get('time_sec') is not None
+                                    and r.get('ladder_size_bp') is not None
                                 ]
                             except Exception as e:
                                 logger.warning(f"Failed to parse size calibration: {e}")
 
                 try:
                     data = parse_electropherogram(rt.raw_file_path)
-                    size_bp = data['size_bp']
+                    time_sec = data['time_sec']
 
                     # image_path stores the original file sample ID (e.g. "SampB1")
                     # that maps to this DB sample_id (e.g. "6238")
@@ -362,7 +402,7 @@ def load_electropherogram_traces(sample_id: str) -> tuple:
                     if matched_rfu is not None:
                         traces.append({
                             'step': rt.step or 'Unknown',
-                            'size_bp': size_bp,
+                            'time_sec': time_sec,
                             'rfu': matched_rfu,
                         })
                 except Exception as e:
@@ -371,7 +411,7 @@ def load_electropherogram_traces(sample_id: str) -> tuple:
     except Exception as e:
         logger.error(f"Failed to load electropherogram traces: {e}")
 
-    return traces, ladder_points
+    return traces, calibration
 
 
 # 전역 인스턴스
@@ -395,10 +435,10 @@ def create_batch_comparison(samples: List[Dict], metric: str = 'gqn_rin', save_p
 
 
 def create_electropherogram_overlay(sample_id: str, traces: List[Dict] = None,
-                                    ladder_points: List[float] = None, save_path: str = None):
+                                    calibration: List[Dict] = None, save_path: str = None):
     """Electropherogram overlay 생성 헬퍼 함수"""
     if traces is None:
-        traces, ladder_points = load_electropherogram_traces(sample_id)
+        traces, calibration = load_electropherogram_traces(sample_id)
     return qc_visualizer.plot_electropherogram_overlay(
-        sample_id, traces, ladder_points=ladder_points, save_path=save_path
+        sample_id, traces, calibration=calibration, save_path=save_path
     )

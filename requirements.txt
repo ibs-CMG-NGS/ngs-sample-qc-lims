@@ -14,3 +14,10 @@ openpyxl>=3.1        # Excel 읽기/쓰기 (Reports 탭 Excel 내보내기)
 
 # Visualization & PDF
 matplotlib>=3.7      # 차트 + PDF 리포트 생성
+
+# Google Sheets 연동
+gspread>=6.0         # Google Sheets API 클라이언트
+google-auth>=2.0     # Service Account 인증
+
+# Date parsing (Pull 시 다양한 날짜 형식 허용)
+python-dateutil>=2.8

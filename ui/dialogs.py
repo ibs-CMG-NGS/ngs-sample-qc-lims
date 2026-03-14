@@ -9,18 +9,21 @@ from PyQt5.QtWidgets import (
     QFileDialog, QTableWidget, QTableWidgetItem, QMessageBox,
     QHeaderView, QDoubleSpinBox, QTextEdit, QAbstractItemView,
     QDateEdit, QListWidget, QListWidgetItem, QSplitter,
+    QInputDialog, QCompleter, QSizePolicy,
 )
 from PyQt5.QtCore import Qt, QDate
 from PyQt5.QtGui import QFont
 import logging
 
-from config.settings import SAMPLE_TYPES, QC_STEPS, SPECIES_LIST, MATERIAL_LIST
+from config.settings import SAMPLE_TYPES, QC_STEPS, RNA_QC_STEPS, SPECIES_LIST, MATERIAL_LIST
+from database.models import Sample
 from database import (
     db_manager, add_sample, get_sample_by_id, update_sample,
     add_qc_metric, get_qc_metrics_by_sample, add_raw_trace,
     get_qc_metric_by_id, update_qc_metric,
     add_femtopulse_run, add_smear_analysis,
     add_note, get_notes_by_sample, update_note, delete_note,
+    get_all_projects, get_project_by_name, add_project, update_project,
 )
 from analysis.qc_judge import qc_judge
 from parsers import (
@@ -33,6 +36,121 @@ from parsers import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class ProjectDialog(QDialog):
+    """프로젝트 등록/수정 다이얼로그
+
+    Args:
+        parent: parent widget
+        edit_name: 수정할 프로젝트 이름. None이면 신규 등록 모드.
+    """
+
+    def __init__(self, parent=None, edit_name=None):
+        super().__init__(parent)
+        self._edit_name = edit_name
+        self.saved_name = None
+        self.setWindowTitle("Edit Project" if edit_name else "New Project")
+        self.setMinimumWidth(380)
+        self._build_ui()
+        if edit_name:
+            self._load_project(edit_name)
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("Required")
+        if self._edit_name:
+            self.name_edit.setReadOnly(True)
+        form.addRow("Project Name:", self.name_edit)
+
+        self.species_combo = QComboBox()
+        self.species_combo.setEditable(True)
+        for sp in SPECIES_LIST:
+            self.species_combo.addItem(sp)
+        self.species_combo.addItem("Other")
+        self.species_combo.setCurrentIndex(-1)
+        self.species_combo.setPlaceholderText("Select or type...")
+        form.addRow("Species:", self.species_combo)
+
+        self.material_combo = QComboBox()
+        self.material_combo.setEditable(True)
+        for mt in MATERIAL_LIST:
+            self.material_combo.addItem(mt)
+        self.material_combo.setCurrentIndex(-1)
+        self.material_combo.setPlaceholderText("Select or type...")
+        form.addRow("Material:", self.material_combo)
+
+        self.type_combo = QComboBox()
+        self.type_combo.addItem("", "")
+        for key, desc in SAMPLE_TYPES.items():
+            self.type_combo.addItem(f"{key} ({desc})", key)
+        form.addRow("Sample Type:", self.type_combo)
+
+        self.desc_edit = QTextEdit()
+        self.desc_edit.setMaximumHeight(70)
+        form.addRow("Description:", self.desc_edit)
+
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _load_project(self, name: str):
+        """편집 모드: 기존 프로젝트 데이터 로드."""
+        try:
+            with db_manager.session_scope() as session:
+                proj = get_project_by_name(session, name)
+                if not proj:
+                    return
+                self.name_edit.setText(proj.project_name)
+                if proj.species:
+                    self.species_combo.setCurrentText(proj.species)
+                if proj.material:
+                    self.material_combo.setCurrentText(proj.material)
+                if proj.sample_type:
+                    idx = self.type_combo.findData(proj.sample_type)
+                    if idx >= 0:
+                        self.type_combo.setCurrentIndex(idx)
+                self.desc_edit.setPlainText(proj.description or "")
+        except Exception as e:
+            logger.error(f"Failed to load project: {e}")
+
+    def _on_accept(self):
+        name = self.name_edit.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Validation", "Project name is required.")
+            return
+
+        data = {
+            "species":     self.species_combo.currentText().strip() or None,
+            "material":    self.material_combo.currentText().strip() or None,
+            "sample_type": self.type_combo.currentData() or None,
+            "description": self.desc_edit.toPlainText().strip() or None,
+        }
+
+        try:
+            with db_manager.session_scope() as session:
+                if self._edit_name:
+                    update_project(session, self._edit_name, data)
+                else:
+                    if get_project_by_name(session, name):
+                        QMessageBox.warning(
+                            self, "Duplicate",
+                            f"Project '{name}' already exists.",
+                        )
+                        return
+                    data["project_name"] = name
+                    add_project(session, data)
+            self.saved_name = name
+            self.accept()
+        except Exception as e:
+            logger.error(f"Failed to save project: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to save project:\n{e}")
 
 
 class SampleDialog(QDialog):
@@ -64,6 +182,28 @@ class SampleDialog(QDialog):
         self.sample_name_edit = QLineEdit()
         self.sample_name_edit.setPlaceholderText("Optional (memo / alias)")
         form.addRow("Sample Name:", self.sample_name_edit)
+
+        self.full_name_edit = QLineEdit()
+        self.full_name_edit.setPlaceholderText("Optional – 고객사 제공 명칭 등")
+        form.addRow("Full Name:", self.full_name_edit)
+
+        proj_row = QHBoxLayout()
+        self.project_combo = QComboBox()
+        self.project_combo.setEditable(False)
+        self.project_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.project_combo.activated.connect(self._on_project_changed)
+        proj_row.addWidget(self.project_combo)
+        self._btn_new_proj = QPushButton("+")
+        self._btn_new_proj.setFixedWidth(28)
+        self._btn_new_proj.setToolTip("새 프로젝트 추가")
+        self._btn_new_proj.clicked.connect(self._add_new_project)
+        proj_row.addWidget(self._btn_new_proj)
+        self._btn_edit_proj = QPushButton("✎")
+        self._btn_edit_proj.setFixedWidth(28)
+        self._btn_edit_proj.setToolTip("현재 프로젝트 속성 편집")
+        self._btn_edit_proj.clicked.connect(self._edit_current_project)
+        proj_row.addWidget(self._btn_edit_proj)
+        form.addRow("Project *", proj_row)
 
         self.species_combo = QComboBox()
         self.species_combo.setEditable(True)
@@ -98,6 +238,68 @@ class SampleDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+        self._load_projects()
+
+    def _load_projects(self):
+        """projects 테이블에서 프로젝트 목록을 읽어 콤보박스에 채운다."""
+        self._project_map = {}
+        try:
+            with db_manager.session_scope() as session:
+                projects = get_all_projects(session)
+                # detach 전에 필요한 속성 미리 추출
+                proj_data = [
+                    {
+                        "project_name": p.project_name,
+                        "species": p.species,
+                        "material": p.material,
+                        "sample_type": p.sample_type,
+                    }
+                    for p in projects
+                ]
+        except Exception:
+            proj_data = []
+
+        self.project_combo.clear()
+        self.project_combo.addItem("")  # 빈 선택지
+        for d in proj_data:
+            self.project_combo.addItem(d["project_name"])
+            self._project_map[d["project_name"]] = d
+
+    def _add_new_project(self):
+        """ProjectDialog로 새 프로젝트를 등록하고 콤보에 추가한다."""
+        dlg = ProjectDialog(parent=self)
+        if dlg.exec_() == QDialog.Accepted:
+            name = dlg.saved_name
+            self._load_projects()
+            self.project_combo.setCurrentText(name)
+            self._on_project_changed(self.project_combo.currentIndex())
+
+    def _edit_current_project(self):
+        """현재 선택된 프로젝트의 속성을 편집한다."""
+        name = self.project_combo.currentText().strip()
+        if not name:
+            QMessageBox.information(self, "Edit Project", "먼저 프로젝트를 선택해주세요.")
+            return
+        dlg = ProjectDialog(parent=self, edit_name=name)
+        if dlg.exec_() == QDialog.Accepted:
+            self._load_projects()
+            self.project_combo.setCurrentText(name)
+
+    def _on_project_changed(self, index: int):
+        """프로젝트 선택 시 species/material/sample_type 자동 채움."""
+        name = self.project_combo.currentText()
+        proj = self._project_map.get(name)
+        if not proj:
+            return
+        if proj.get("species"):
+            self.species_combo.setCurrentText(proj["species"])
+        if proj.get("material"):
+            self.material_combo.setCurrentText(proj["material"])
+        if proj.get("sample_type"):
+            idx = self.type_combo.findData(proj["sample_type"])
+            if idx >= 0:
+                self.type_combo.setCurrentIndex(idx)
+
     def _load_sample(self, sample_id):
         """편집 모드: 기존 샘플 데이터 로드."""
         try:
@@ -108,6 +310,11 @@ class SampleDialog(QDialog):
                 self.sample_id_edit.setText(sample.sample_id)
                 self.sample_id_edit.setReadOnly(True)
                 self.sample_name_edit.setText(sample.sample_name or "")
+                self.full_name_edit.setText(getattr(sample, 'full_name', None) or "")
+                project = getattr(sample, 'project', None) or ""
+                if project and self.project_combo.findText(project) == -1:
+                    self.project_combo.addItem(project)
+                self.project_combo.setCurrentText(project)
                 if sample.species:
                     self.species_combo.setCurrentText(sample.species)
                 if sample.material:
@@ -125,11 +332,18 @@ class SampleDialog(QDialog):
             QMessageBox.warning(self, "Validation", "Sample ID is required.")
             return
 
+        project = self.project_combo.currentText().strip()
+        if not project:
+            QMessageBox.warning(self, "Validation", "Project를 선택하거나 '+' 버튼으로 추가해주세요.")
+            return
+
         species_text = self.species_combo.currentText().strip()
         material_text = self.material_combo.currentText().strip()
 
         data = {
             "sample_name": self.sample_name_edit.text().strip() or None,
+            "full_name": self.full_name_edit.text().strip() or None,
+            "project": project,
             "species": species_text or None,
             "material": material_text or None,
             "sample_type": self.type_combo.currentData(),
@@ -166,10 +380,11 @@ class NanoDropDialog(QDialog):
         edit_metric_id: 수정할 QCMetric PK. None이면 신규 입력 모드.
     """
 
-    def __init__(self, sample_id, parent=None, edit_metric_id=None):
+    def __init__(self, sample_id, parent=None, edit_metric_id=None, sample_type: str = "WGS"):
         super().__init__(parent)
         self.sample_id = sample_id
         self._edit_metric_id = edit_metric_id
+        self._sample_type = sample_type
         title = "Edit NanoDrop" if edit_metric_id else "NanoDrop"
         self.setWindowTitle(f"{title} - {sample_id}")
         self.setMinimumWidth(350)
@@ -201,7 +416,8 @@ class NanoDropDialog(QDialog):
         form.addRow("260/230:", self.r230_spin)
 
         self.step_combo = QComboBox()
-        for s in QC_STEPS:
+        steps = RNA_QC_STEPS if self._sample_type == "mRNA-seq" else QC_STEPS
+        for s in steps:
             self.step_combo.addItem(s)
         form.addRow("Step:", self.step_combo)
 
@@ -234,6 +450,9 @@ class NanoDropDialog(QDialog):
                 idx = self.step_combo.findText(m.step)
                 if idx >= 0:
                     self.step_combo.setCurrentIndex(idx)
+                elif m.step:
+                    self.step_combo.addItem(m.step)
+                    self.step_combo.setCurrentText(m.step)
                 if m.measured_at:
                     self.date_edit.setDate(QDate(
                         m.measured_at.year, m.measured_at.month, m.measured_at.day
@@ -257,11 +476,13 @@ class NanoDropDialog(QDialog):
 
         try:
             with db_manager.session_scope() as session:
-                # QC 자동 판정
+                # QC 자동 판정 (purity 포함)
                 sample = get_sample_by_id(session, self.sample_id)
                 if sample:
                     data["status"] = qc_judge.judge_qc(sample.sample_type, {
                         "concentration": data["concentration"],
+                        "purity_260_280": data["purity_260_280"],
+                        "purity_260_230": data["purity_260_230"],
                         "step": step,
                     })
                 if self._edit_metric_id:
@@ -285,10 +506,12 @@ class QubitDialog(QDialog):
         edit_metric_id: 수정할 QCMetric PK. None이면 신규 입력 모드.
     """
 
-    def __init__(self, sample_id, parent=None, edit_metric_id=None):
+    def __init__(self, sample_id, parent=None, edit_metric_id=None, sample_type: str = "WGS"):
         super().__init__(parent)
         self.sample_id = sample_id
         self._edit_metric_id = edit_metric_id
+        self._sample_type = sample_type
+        self._steps = RNA_QC_STEPS if sample_type == "mRNA-seq" else QC_STEPS
         title = "Edit Qubit" if edit_metric_id else "Qubit"
         self.setWindowTitle(f"{title} - {sample_id}")
         self.setMinimumWidth(380)
@@ -324,10 +547,18 @@ class QubitDialog(QDialog):
         form.addRow("Assay Type:", self.assay_edit)
 
         self.step_combo = QComboBox()
-        for s in QC_STEPS:
+        for s in self._steps:
             self.step_combo.addItem(s)
         self.step_combo.currentIndexChanged.connect(self._update_recovery)
+        self.step_combo.currentIndexChanged.connect(self._toggle_index_field)
         form.addRow("Step:", self.step_combo)
+
+        self._index_label = QLabel("Index No:")
+        self.index_edit = QLineEdit()
+        self.index_edit.setPlaceholderText("e.g. A04, H03")
+        self._index_label.hide()
+        self.index_edit.hide()
+        form.addRow(self._index_label, self.index_edit)
 
         self.recovery_label = QLabel("-")
         form.addRow("Recovery:", self.recovery_label)
@@ -359,12 +590,22 @@ class QubitDialog(QDialog):
                 idx = self.step_combo.findText(m.step)
                 if idx >= 0:
                     self.step_combo.setCurrentIndex(idx)
+                elif m.step:
+                    self.step_combo.addItem(m.step)
+                    self.step_combo.setCurrentText(m.step)
+                if m.index_no:
+                    self.index_edit.setText(m.index_no)
                 if m.measured_at:
                     self.date_edit.setDate(QDate(
                         m.measured_at.year, m.measured_at.month, m.measured_at.day
                     ))
         except Exception as e:
             logger.error(f"Failed to load metric: {e}")
+
+    def _toggle_index_field(self):
+        visible = self.step_combo.currentText() in ("Library Prep", "Library Prep (RNA)")
+        self._index_label.setVisible(visible)
+        self.index_edit.setVisible(visible)
 
     def _get_total(self):
         return self.conc_spin.value() * self.vol_spin.value()
@@ -377,13 +618,13 @@ class QubitDialog(QDialog):
     def _update_recovery(self):
         total = self._get_total()
         step = self.step_combo.currentText()
-        step_idx = QC_STEPS.index(step) if step in QC_STEPS else -1
+        step_idx = self._steps.index(step) if step in self._steps else -1
 
         if step_idx <= 0 or total <= 0:
             self.recovery_label.setText("-")
             return
 
-        prev_step = QC_STEPS[step_idx - 1]
+        prev_step = self._steps[step_idx - 1]
         try:
             with db_manager.session_scope() as session:
                 prev_metrics = [
@@ -410,12 +651,15 @@ class QubitDialog(QDialog):
         qd = self.date_edit.date()
         measured_at = datetime(qd.year(), qd.month(), qd.day())
 
+        index_no = self.index_edit.text().strip() or None
+
         data = {
             "step": step,
             "concentration": self.conc_spin.value(),
             "volume": self.vol_spin.value(),
             "total_amount": total,
             "measured_at": measured_at,
+            "index_no": index_no,
         }
 
         try:
@@ -470,6 +714,8 @@ class FemtoPulseDialog(QDialog):
         self._file_map = {}          # {type: path}
         self._quality_rows = []      # parsed quality table rows
         self._folder_data = None     # full parse result
+        self._db_sample_ids = []     # [(sample_id, sample_name), ...]
+        self._load_db_samples()
         self._build_ui()
 
     def _build_ui(self):
@@ -491,7 +737,7 @@ class FemtoPulseDialog(QDialog):
         step_row = QHBoxLayout()
         step_row.addWidget(QLabel("Step:"))
         self.step_combo = QComboBox()
-        for s in QC_STEPS:
+        for s in QC_STEPS + RNA_QC_STEPS:
             self.step_combo.addItem(s)
         step_row.addWidget(self.step_combo)
         step_row.addSpacing(20)
@@ -523,7 +769,7 @@ class FemtoPulseDialog(QDialog):
         self.preview_table = QTableWidget()
         self.preview_table.setColumnCount(5)
         self.preview_table.setHorizontalHeaderLabels([
-            "Well", "File Sample", "DB Sample ID", "DQN", "Conc (ng/ul)",
+            "Well", "File Sample", "DB Sample ID", "DQN/RQN", "Conc (ng/ul)",
         ])
         self.preview_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         layout.addWidget(self.preview_table)
@@ -535,6 +781,44 @@ class FemtoPulseDialog(QDialog):
         self.ok_button = buttons.button(QDialogButtonBox.Ok)
         self.ok_button.setEnabled(False)
         layout.addWidget(buttons)
+
+    def _load_db_samples(self):
+        """DB의 전체 샘플 목록을 미리 로드한다."""
+        try:
+            with db_manager.session_scope() as session:
+                rows = (session.query(Sample.sample_id, Sample.sample_name)
+                        .order_by(Sample.sample_id).all())
+                self._db_sample_ids = [(r.sample_id, r.sample_name or "") for r in rows]
+        except Exception as e:
+            logger.warning(f"DB sample load failed: {e}")
+            self._db_sample_ids = []
+
+    def _make_sample_combo(self, auto_match_id: str = "") -> QComboBox:
+        """DB 샘플 ID 선택용 QComboBox를 생성하고 자동 매칭을 시도한다."""
+        combo = QComboBox()
+        combo.setEditable(True)
+        combo.addItem("")
+        sid_list = []
+        for sid, sname in self._db_sample_ids:
+            combo.addItem(sid)
+            display = f"{sid}  {sname}".strip()
+            combo.setItemData(combo.count() - 1, display, Qt.ToolTipRole)
+            sid_list.append(sid)
+
+        completer = QCompleter(sid_list, combo)
+        completer.setFilterMode(Qt.MatchContains)
+        completer.setCaseSensitivity(Qt.CaseInsensitive)
+        combo.setCompleter(completer)
+
+        # 자동 매칭: 정확 일치 → 대소문자 무시 순으로 시도
+        if auto_match_id in sid_list:
+            combo.setCurrentText(auto_match_id)
+        else:
+            lower_map = {s.lower(): s for s in sid_list}
+            if auto_match_id.lower() in lower_map:
+                combo.setCurrentText(lower_map[auto_match_id.lower()])
+
+        return combo
 
     def _browse_folder(self):
         folder = QFileDialog.getExistingDirectory(
@@ -587,10 +871,9 @@ class FemtoPulseDialog(QDialog):
             fsid_item.setFlags(fsid_item.flags() & ~Qt.ItemIsEditable)
             self.preview_table.setItem(row, 1, fsid_item)
 
-            # DB Sample ID: blank by default — user fills in only samples to import
-            db_id_item = QTableWidgetItem('')
-            db_id_item.setToolTip("Enter DB Sample ID to import this row")
-            self.preview_table.setItem(row, 2, db_id_item)
+            # DB Sample ID: QComboBox with auto-match from file sample_id
+            combo = self._make_sample_combo(file_sid)
+            self.preview_table.setCellWidget(row, 2, combo)
 
             def _fmt(v):
                 return f"{v:.2f}" if v is not None else "-"
@@ -611,12 +894,38 @@ class FemtoPulseDialog(QDialog):
         skipped = []
         smear_saved = 0
 
+        # 동일 (run_folder, step) 중복 임포트 방지
+        try:
+            from database.models import FemtoPulseRun as _FPRun
+            with db_manager.session_scope() as _chk_session:
+                existing = (
+                    _chk_session.query(_FPRun)
+                    .filter(
+                        _FPRun.run_folder == self._folder_path,
+                        _FPRun.step == step,
+                    )
+                    .first()
+                )
+            if existing:
+                reply = QMessageBox.question(
+                    self, "Duplicate Run",
+                    f"This folder has already been imported as '{step}'.\n"
+                    "Import again? (duplicate data will be created)",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if reply != QMessageBox.Yes:
+                    return
+        except Exception:
+            pass  # 체크 실패해도 임포트는 계속 허용
+
         try:
             with db_manager.session_scope() as session:
                 # 1. Create FemtoPulseRun record
                 run = add_femtopulse_run(session, {
                     'run_folder': self._folder_path,
                     'step': step,
+                    'measured_at': measured_at,
                     'quality_table_path': self._file_map.get('quality_table'),
                     'peak_table_path': self._file_map.get('peak_table'),
                     'electropherogram_path': self._file_map.get('electropherogram'),
@@ -627,8 +936,8 @@ class FemtoPulseDialog(QDialog):
                 # Build file_sample_id -> db_sample_id mapping (only filled rows)
                 sid_map = {}  # file_sample_id -> db_sample_id
                 for row, r in enumerate(self._quality_rows):
-                    db_sid_item = self.preview_table.item(row, 2)
-                    db_sid = db_sid_item.text().strip() if db_sid_item else ""
+                    combo = self.preview_table.cellWidget(row, 2)
+                    db_sid = combo.currentText().strip() if combo else ""
                     file_sid = r.get('sample_id', '')
                     if db_sid:
                         sid_map[file_sid] = db_sid

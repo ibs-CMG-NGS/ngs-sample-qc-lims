@@ -6,6 +6,7 @@ from PyQt5.QtWidgets import (
     QTableWidget, QTableWidgetItem, QPushButton,
     QHeaderView, QLabel, QMessageBox, QAbstractItemView,
     QMenu, QAction, QDialog, QDialogButtonBox,
+    QLineEdit, QComboBox,
 )
 from PyQt5.QtCore import Qt
 import logging
@@ -29,14 +30,17 @@ from analysis.visualizer import load_electropherogram_traces, qc_visualizer
 logger = logging.getLogger(__name__)
 
 # Sample list columns
-SAMPLE_COLS = ["Sample ID", "Name", "Species", "Material", "Type", "Created"]
+SAMPLE_COLS = ["Sample ID", "Name", "Project", "Species", "Material", "Type", "Description", "Created"]
+_COL_TYPE        = SAMPLE_COLS.index("Type")
+_COL_DESCRIPTION = SAMPLE_COLS.index("Description")
+_COL_CREATED     = SAMPLE_COLS.index("Created")
 
 # QC detail columns
 QC_COLS = [
     "Step", "Instrument", "Conc", "Vol", "Total",
-    "Recovery", "260/280", "GQN", "AvgSize",
+    "Recovery", "260/280", "DQN/RQN", "AvgSize",
     "1k-10k%", "10k-165k%",
-    "Molarity", "Status", "Date",
+    "Status", "Date",
 ]
 
 
@@ -110,16 +114,37 @@ class SampleTab(QWidget):
         top_layout.setContentsMargins(0, 0, 0, 0)
         top_layout.addWidget(QLabel("Sample List"))
 
+        # Filter bar
+        filter_bar = QHBoxLayout()
+        filter_bar.addWidget(QLabel("Search:"))
+        self.filter_edit = QLineEdit()
+        self.filter_edit.setPlaceholderText("Sample ID / Name / Project...")
+        self.filter_edit.textChanged.connect(self._apply_filter)
+        filter_bar.addWidget(self.filter_edit)
+
+        filter_bar.addWidget(QLabel("Type:"))
+        self.filter_type_combo = QComboBox()
+        self.filter_type_combo.addItem("All")
+        self.filter_type_combo.currentTextChanged.connect(self._apply_filter)
+        filter_bar.addWidget(self.filter_type_combo)
+
+        btn_clear_filter = QPushButton("Clear")
+        btn_clear_filter.setFixedWidth(55)
+        btn_clear_filter.clicked.connect(self._clear_filter)
+        filter_bar.addWidget(btn_clear_filter)
+        filter_bar.addStretch()
+        top_layout.addLayout(filter_bar)
+
         self.sample_table = QTableWidget()
         self.sample_table.setColumnCount(len(SAMPLE_COLS))
         self.sample_table.setHorizontalHeaderLabels(SAMPLE_COLS)
         self.sample_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.sample_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.sample_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.sample_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.sample_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.Interactive
-        )
-        self.sample_table.horizontalHeader().setStretchLastSection(True)
+        hdr = self.sample_table.horizontalHeader()
+        hdr.setSectionResizeMode(QHeaderView.Interactive)
+        hdr.setSectionResizeMode(_COL_DESCRIPTION, QHeaderView.Stretch)
+        hdr.setStretchLastSection(False)
         self.sample_table.setSortingEnabled(True)
         self.sample_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.sample_table.customContextMenuRequested.connect(self._on_sample_context_menu)
@@ -172,6 +197,7 @@ class SampleTab(QWidget):
             with db_manager.session_scope() as session:
                 samples = get_all_samples(session)
                 self.sample_table.setRowCount(len(samples))
+                types_seen = set()
 
                 for row, s in enumerate(samples):
                     self.sample_table.setItem(
@@ -182,16 +208,28 @@ class SampleTab(QWidget):
                     )
                     self.sample_table.setItem(
                         row, 2, QTableWidgetItem(
-                            getattr(s, 'species', None) or ""
+                            getattr(s, 'project', None) or ""
                         )
                     )
                     self.sample_table.setItem(
                         row, 3, QTableWidgetItem(
-                            getattr(s, 'material', None) or ""
+                            getattr(s, 'species', None) or ""
                         )
                     )
                     self.sample_table.setItem(
-                        row, 4, QTableWidgetItem(s.sample_type or "")
+                        row, 4, QTableWidgetItem(
+                            getattr(s, 'material', None) or ""
+                        )
+                    )
+                    type_val = s.sample_type or ""
+                    self.sample_table.setItem(
+                        row, _COL_TYPE, QTableWidgetItem(type_val)
+                    )
+                    if type_val:
+                        types_seen.add(type_val)
+                    self.sample_table.setItem(
+                        row, _COL_DESCRIPTION,
+                        QTableWidgetItem(getattr(s, 'description', None) or "")
                     )
 
                     created = (
@@ -200,13 +238,82 @@ class SampleTab(QWidget):
                         else "-"
                     )
                     self.sample_table.setItem(
-                        row, 5, QTableWidgetItem(created)
+                        row, _COL_CREATED, QTableWidgetItem(created)
                     )
+
+                self._update_filter_options(sorted(types_seen))
 
         except Exception as e:
             logger.error(f"Failed to load samples: {e}")
         finally:
             self.sample_table.setSortingEnabled(True)
+            self._apply_filter()
+
+    # ── Filtering ────────────────────────────────────────────────────
+
+    def _update_filter_options(self, types: list):
+        """Type 필터 콤보박스를 현재 데이터에 맞게 갱신."""
+        current = self.filter_type_combo.currentText()
+        self.filter_type_combo.blockSignals(True)
+        self.filter_type_combo.clear()
+        self.filter_type_combo.addItem("All")
+        for t in types:
+            self.filter_type_combo.addItem(t)
+        idx = self.filter_type_combo.findText(current)
+        self.filter_type_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.filter_type_combo.blockSignals(False)
+
+    def _apply_filter(self):
+        """현재 필터 조건에 맞지 않는 행을 숨김."""
+        text = self.filter_edit.text().strip().lower()
+        type_filter = self.filter_type_combo.currentText()
+
+        for row in range(self.sample_table.rowCount()):
+            show = True
+
+            if text:
+                # Sample ID(0), Name(1), Project(2) 에서 검색
+                match = any(
+                    (item := self.sample_table.item(row, col)) and
+                    text in item.text().lower()
+                    for col in (0, 1, 2)
+                )
+                if not match:
+                    show = False
+
+            if show and type_filter != "All":
+                type_item = self.sample_table.item(row, _COL_TYPE)
+                if not type_item or type_item.text() != type_filter:
+                    show = False
+
+            self.sample_table.setRowHidden(row, not show)
+
+    def _clear_filter(self):
+        """필터 초기화."""
+        self.filter_edit.clear()
+        self.filter_type_combo.setCurrentIndex(0)
+
+    def get_visible_sample_ids(self) -> list[str]:
+        """현재 필터 조건에 의해 보이는 샘플 ID 목록."""
+        ids = []
+        for row in range(self.sample_table.rowCount()):
+            if not self.sample_table.isRowHidden(row):
+                item = self.sample_table.item(row, 0)
+                if item:
+                    ids.append(item.text())
+        return ids
+
+    def get_selected_sample_ids(self) -> list[str]:
+        """현재 선택된(하이라이트) 샘플 ID 목록."""
+        seen = set()
+        ids = []
+        for idx in self.sample_table.selectedIndexes():
+            if idx.column() == 0:
+                sid = idx.data()
+                if sid and sid not in seen:
+                    seen.add(sid)
+                    ids.append(sid)
+        return ids
 
     def _on_sample_context_menu(self, pos):
         """Sample list 우클릭 컨텍스트 메뉴."""
@@ -246,6 +353,10 @@ class SampleTab(QWidget):
         notes_action.triggered.connect(lambda: NoteDialog(sample_id, self).exec_())
         menu.addAction(notes_action)
 
+        rejudge_action = QAction("Re-judge QC Status", self)
+        rejudge_action.triggered.connect(lambda: self._rejudge_sample(sample_id))
+        menu.addAction(rejudge_action)
+
         menu.addSeparator()
 
         del_action = QAction("Delete Sample", self)
@@ -254,19 +365,72 @@ class SampleTab(QWidget):
 
         menu.exec_(self.sample_table.viewport().mapToGlobal(pos))
 
+    def _rejudge_sample(self, sample_id: str):
+        """선택한 샘플의 모든 QCMetric에 대해 판정 재실행."""
+        from database.models import QCMetric, Sample
+        from analysis.qc_judge import qc_judge
+
+        counts = {"Pass": 0, "Warning": 0, "Fail": 0, "Pending": 0}
+        try:
+            with db_manager.session_scope() as session:
+                sample = session.query(Sample).filter(
+                    Sample.sample_id == sample_id
+                ).first()
+                if not sample:
+                    return
+                metrics = session.query(QCMetric).filter(
+                    QCMetric.sample_id == sample_id
+                ).all()
+                for m in metrics:
+                    qc_data = {
+                        "step":           m.step,
+                        "concentration":  m.concentration,
+                        "total_amount":   m.total_amount,
+                        "gqn_rin":        m.gqn_rin,
+                        "avg_size":       m.avg_size,
+                        "purity_260_280": m.purity_260_280,
+                        "purity_260_230": m.purity_260_230,
+                    }
+                    new_status = qc_judge.judge_qc(sample.sample_type, qc_data)
+                    m.status = new_status
+                    counts[new_status] = counts.get(new_status, 0) + 1
+
+            self._load_qc_details(sample_id)
+            total = sum(counts.values())
+            detail = "  /  ".join(
+                f"{s}: {n}" for s, n in counts.items() if n > 0
+            )
+            QMessageBox.information(
+                self, "Re-judge Complete",
+                f"{sample_id}: {total}개 레코드 업데이트\n{detail}",
+            )
+        except Exception as e:
+            logger.error(f"Re-judge failed for {sample_id}: {e}")
+            QMessageBox.critical(self, "Error", f"Re-judge 실패:\n{e}")
+
     def _edit_sample_by_id(self, sample_id):
         dlg = SampleDialog(self, edit_sample_id=sample_id)
         if dlg.exec_() == SampleDialog.Accepted:
             self.refresh_samples()
 
+    def _get_sample_type(self, sample_id: str) -> str:
+        """DB에서 sample_type을 조회. 실패 시 'WGS' 반환."""
+        try:
+            from database import get_sample_by_id
+            with db_manager.session_scope() as session:
+                s = get_sample_by_id(session, sample_id)
+                return s.sample_type if s else "WGS"
+        except Exception:
+            return "WGS"
+
     def _open_nanodrop_for(self, sample_id):
-        dlg = NanoDropDialog(sample_id, self)
+        dlg = NanoDropDialog(sample_id, self, sample_type=self._get_sample_type(sample_id))
         if dlg.exec_() == NanoDropDialog.Accepted:
             self._selected_sample_id = sample_id
             self._load_qc_details(sample_id)
 
     def _open_qubit_for(self, sample_id):
-        dlg = QubitDialog(sample_id, self)
+        dlg = QubitDialog(sample_id, self, sample_type=self._get_sample_type(sample_id))
         if dlg.exec_() == QubitDialog.Accepted:
             self._selected_sample_id = sample_id
             self._load_qc_details(sample_id)
@@ -364,17 +528,13 @@ class SampleTab(QWidget):
                     self.qc_table.setItem(row, 9, QTableWidgetItem(pct_1k_10k))
                     self.qc_table.setItem(row, 10, QTableWidgetItem(pct_10k_165k))
 
-                    self.qc_table.setItem(
-                        row, 11, QTableWidgetItem(_fmt(m.molarity))
-                    )
-
                     status_text = m.status or "-"
                     status_item = QTableWidgetItem(status_text)
                     color = STATUS_COLORS.get(status_text)
                     if color:
                         from PyQt5.QtGui import QColor
                         status_item.setForeground(QColor(color))
-                    self.qc_table.setItem(row, 12, status_item)
+                    self.qc_table.setItem(row, 11, status_item)
 
                     date_str = (
                         m.measured_at.strftime("%Y-%m-%d")
@@ -382,7 +542,7 @@ class SampleTab(QWidget):
                         else "-"
                     )
                     self.qc_table.setItem(
-                        row, 13, QTableWidgetItem(date_str)
+                        row, 12, QTableWidgetItem(date_str)
                     )
 
         except Exception as e:
@@ -436,11 +596,24 @@ class SampleTab(QWidget):
             return None
         return self._selected_sample_id
 
+    def _get_all_selected_sample_ids(self):
+        """현재 선택된 모든 sample_id 리스트 반환 (중복 제거, 순서 유지)."""
+        seen = set()
+        ids = []
+        for idx in self.sample_table.selectedIndexes():
+            if idx.column() != 0:
+                continue
+            item = self.sample_table.item(idx.row(), 0)
+            if item and item.text() not in seen:
+                seen.add(item.text())
+                ids.append(item.text())
+        return ids
+
     def _open_nanodrop(self):
         sample_id = self._get_selected_sample_id()
         if not sample_id:
             return
-        dlg = NanoDropDialog(sample_id, self)
+        dlg = NanoDropDialog(sample_id, self, sample_type=self._get_sample_type(sample_id))
         if dlg.exec_() == NanoDropDialog.Accepted:
             self._load_qc_details(sample_id)
 
@@ -448,7 +621,7 @@ class SampleTab(QWidget):
         sample_id = self._get_selected_sample_id()
         if not sample_id:
             return
-        dlg = QubitDialog(sample_id, self)
+        dlg = QubitDialog(sample_id, self, sample_type=self._get_sample_type(sample_id))
         if dlg.exec_() == QubitDialog.Accepted:
             self._load_qc_details(sample_id)
 
@@ -516,9 +689,11 @@ class SampleTab(QWidget):
             return
 
         if instrument == "NanoDrop":
-            dlg = NanoDropDialog(sample_id, self, edit_metric_id=metric_id)
+            dlg = NanoDropDialog(sample_id, self, edit_metric_id=metric_id,
+                                 sample_type=self._get_sample_type(sample_id))
         elif instrument == "Qubit":
-            dlg = QubitDialog(sample_id, self, edit_metric_id=metric_id)
+            dlg = QubitDialog(sample_id, self, edit_metric_id=metric_id,
+                              sample_type=self._get_sample_type(sample_id))
         else:
             QMessageBox.information(
                 self, "Info",
@@ -544,10 +719,15 @@ class SampleTab(QWidget):
         dlg.exec_()
 
     def _open_electropherogram(self):
-        sample_id = self._get_selected_sample_id()
-        if not sample_id:
+        sample_ids = self._get_all_selected_sample_ids()
+        if not sample_ids:
+            QMessageBox.information(self, "No Selection",
+                                    "Please select one or more samples first.")
             return
-        self._show_electropherogram_for(sample_id)
+        if len(sample_ids) == 1:
+            self._show_electropherogram_for(sample_ids[0])
+        else:
+            self._show_electropherogram_multi(sample_ids)
 
     def _show_electropherogram_for(self, sample_id):
         """Load traces and display electropherogram overlay in a dialog."""
@@ -558,7 +738,7 @@ class SampleTab(QWidget):
             )
             return
 
-        traces, ladder_points = load_electropherogram_traces(sample_id)
+        traces, calibration = load_electropherogram_traces(sample_id)
         if not traces:
             QMessageBox.information(
                 self, "No Data",
@@ -568,7 +748,7 @@ class SampleTab(QWidget):
             return
 
         fig = qc_visualizer.plot_electropherogram_overlay(
-            sample_id, traces, ladder_points=ladder_points
+            sample_id, traces, calibration=calibration
         )
         if fig is None:
             return
@@ -580,6 +760,58 @@ class SampleTab(QWidget):
 
         layout = QVBoxLayout(dlg)
 
+        canvas = FigureCanvas(fig)
+        toolbar = NavigationToolbar(canvas, dlg)
+        layout.addWidget(toolbar)
+        layout.addWidget(canvas)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.accept)
+        layout.addWidget(close_btn)
+
+        dlg.exec_()
+
+    def _show_electropherogram_multi(self, sample_ids):
+        """여러 샘플의 electropherogram을 하나의 그래프에 오버레이."""
+        if not HAS_MPL_QT:
+            QMessageBox.warning(self, "Missing Dependency",
+                                "matplotlib Qt5 backend is required.")
+            return
+
+        all_traces = []
+        calibration = None
+
+        for sid in sample_ids:
+            traces, cal = load_electropherogram_traces(sid)
+            if calibration is None and cal:
+                calibration = cal
+            for tr in traces:
+                all_traces.append({
+                    'step': f"{sid}  [{tr['step']}]",
+                    'time_sec': tr['time_sec'],
+                    'rfu': tr['rfu'],
+                })
+
+        if not all_traces:
+            QMessageBox.information(
+                self, "No Data",
+                "선택한 샘플 중 Electropherogram 데이터가 없습니다.\n"
+                "Femto Pulse 데이터를 먼저 업로드하세요.",
+            )
+            return
+
+        title = f"Electropherogram Comparison  ({len(sample_ids)} samples)"
+        fig = qc_visualizer.plot_electropherogram_overlay(
+            title, all_traces, calibration=calibration
+        )
+        if fig is None:
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.setMinimumSize(1000, 620)
+
+        layout = QVBoxLayout(dlg)
         canvas = FigureCanvas(fig)
         toolbar = NavigationToolbar(canvas, dlg)
         layout.addWidget(toolbar)

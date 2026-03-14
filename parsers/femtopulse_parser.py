@@ -174,7 +174,7 @@ def parse_quality_table(path: str) -> List[Dict]:
     col_map = _detect_columns(df, {
         'well': ['well'],
         'sample_id': ['sample name', 'sample_name', 'sample id', 'name'],
-        'dqn': ['dqn', 'gqn', 'quality number'],
+        'dqn': ['dqn', 'gqn', 'rqn', 'rin', 'quality number'],
         'threshold': ['threshold', 'quality threshold'],
         'total_concentration': ['total concentration', 'total conc', 'concentration', 'conc', 'ng/ul', 'ng/µl'],
     })
@@ -224,7 +224,7 @@ def parse_peak_table(path: str) -> List[Dict]:
         'tic': ['total integrated conc.', 'tic', 'total integrated'],
         'tim': ['total integrated molarity', 'tim'],
         'total_conc': ['total conc.', 'total concentration'],
-        'dqn': ['dqn', 'gqn', 'quality number'],
+        'dqn': ['dqn', 'gqn', 'rqn', 'rin', 'quality number'],
     })
 
     # Group by well/sample block
@@ -302,28 +302,35 @@ def parse_peak_table(path: str) -> List[Dict]:
 def parse_electropherogram(path: str) -> Dict:
     """Parse Electropherogram CSV.
 
+    The first column is Size (bp) — already converted by the Femto Pulse
+    instrument software. Values typically range from ~2 bp to ~550,000 bp.
+    The Size Calibration file provides the specific bp positions of ladder
+    markers for use as axis tick references.
+
     Returns:
         {
-            'size_bp': ndarray,
-            'samples': {column_name: ndarray of RFU values},
+            'time_sec': ndarray,   # Size (bp) values — key name kept for compat
+            'size_bp':  ndarray,   # same array, explicit alias
+            'samples':  {column_name: ndarray of RFU values},
         }
     Includes all columns (including ladder).
     """
     df = _read_csv_safe(path)
     df.columns = df.columns.str.strip()
 
-    # First column is typically Size [bp] or similar
-    size_col = df.columns[0]
-    size_bp = pd.to_numeric(df[size_col], errors='coerce').values
+    # First column: Size (bp)
+    time_col = df.columns[0]
+    time_sec = pd.to_numeric(df[time_col], errors='coerce').values
 
     samples = {}
     for col in df.columns[1:]:
         samples[col] = pd.to_numeric(df[col], errors='coerce').values
 
-    logger.info(f"Electropherogram: {len(samples)} channels, {len(size_bp)} points from {Path(path).name}")
+    logger.info(f"Electropherogram: {len(samples)} channels, {len(time_sec)} points from {Path(path).name}")
     return {
-        'size_bp': size_bp,
-        'samples': samples,
+        'time_sec': time_sec,
+        'size_bp':  time_sec,   # backward-compat alias
+        'samples':  samples,
     }
 
 
@@ -377,7 +384,7 @@ def parse_smear_analysis(path: str) -> List[Dict]:
         'avg_size': ['average size', 'avg. size', 'avg size', 'avg_size'],
         'cv': ['cv', 'coefficient of variation'],
         'threshold': ['threshold', 'quality threshold'],
-        'dqn': ['dqn', 'gqn', 'quality number'],
+        'dqn': ['dqn', 'gqn', 'rqn', 'rin', 'quality number'],
     })
 
     results = []
@@ -534,7 +541,7 @@ def _parse_generic_csv(file_path: str) -> List[Dict]:
 
     col_map = _detect_columns(df, {
         'sample_name': ['sample name', 'sample_name', 'name', 'well'],
-        'gqn': ['gqn', 'quality number', 'rin', 'dqn'],
+        'gqn': ['gqn', 'rqn', 'rin', 'dqn', 'quality number'],
         'concentration': ['concentration', 'conc', 'ng/ul', 'ng/µl', 'total concentration'],
         'avg_size': ['average size', 'avg. size', 'avg size', 'mean size'],
         'peak_size': ['peak size', 'modal size'],
@@ -559,6 +566,34 @@ def _parse_generic_csv(file_path: str) -> List[Dict]:
     return results
 
 
+def extract_ladder_trace(electropherogram_path: str) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """Extract the ladder channel from an electropherogram file.
+
+    Identification order:
+      1. Any column whose name contains 'ladder'
+      2. Fallback: the last column (Femto Pulse convention — ladder runs last)
+
+    Returns:
+        (size_bp, rfu) tuple of numpy arrays, or None on failure.
+    """
+    try:
+        data = parse_electropherogram(electropherogram_path)
+        time_sec = data['time_sec']
+        samples = data['samples']
+        if not samples:
+            return None
+        for col_name, rfu in samples.items():
+            if 'ladder' in col_name.lower():
+                logger.info(f"Ladder column found by name: '{col_name}'")
+                return (time_sec, rfu)
+        last_col = list(samples.keys())[-1]
+        logger.info(f"Ladder column by fallback (last): '{last_col}'")
+        return (time_sec, samples[last_col])
+    except Exception as e:
+        logger.error(f"extract_ladder_trace failed ({electropherogram_path}): {e}")
+        return None
+
+
 def get_sizing_curve(file_path: str, sample_id: str) -> Optional[Tuple[np.ndarray, np.ndarray]]:
     """Extract sizing curve for a specific sample from an Electropherogram file."""
     ftype = detect_file_type(file_path)
@@ -567,10 +602,10 @@ def get_sizing_curve(file_path: str, sample_id: str) -> Optional[Tuple[np.ndarra
 
     try:
         data = parse_electropherogram(file_path)
-        size_bp = data['size_bp']
+        time_sec = data['time_sec']
         for col_name, rfu in data['samples'].items():
             if sample_id in col_name:
-                return (size_bp, rfu)
+                return (time_sec, rfu)
     except Exception as e:
         logger.error(f"Failed to extract sizing curve: {e}")
 

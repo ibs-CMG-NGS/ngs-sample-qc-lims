@@ -208,7 +208,7 @@ class ReportsTab(QWidget):
         # QC 상세 테이블 (미리보기)
         self.qc_preview = QTableWidget()
         qc_cols = ["Step", "Instrument", "Conc (ng/ul)", "Vol (ul)",
-                   "Total (ng)", "GQN/RIN", "Avg Size (bp)", "Molarity (nM)", "Status", "Date"]
+                   "Total (ng)", "GQN/RIN", "Avg Size (bp)", "Status", "Date"]
         self.qc_preview.setColumnCount(len(qc_cols))
         self.qc_preview.setHorizontalHeaderLabels(qc_cols)
         self.qc_preview.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -362,7 +362,6 @@ class ReportsTab(QWidget):
                         "total_amount": m.total_amount,
                         "gqn_rin": m.gqn_rin,
                         "avg_size": m.avg_size,
-                        "molarity": m.molarity,
                         "status": m.status,
                         "measured_at": m.measured_at,
                     }
@@ -408,20 +407,19 @@ class ReportsTab(QWidget):
             self.qc_preview.setItem(row, 4, QTableWidgetItem(_fmt(m["total_amount"])))
             self.qc_preview.setItem(row, 5, QTableWidgetItem(_fmt(m["gqn_rin"])))
             self.qc_preview.setItem(row, 6, QTableWidgetItem(_fmt(m["avg_size"], 0)))
-            self.qc_preview.setItem(row, 7, QTableWidgetItem(_fmt(m["molarity"])))
 
             status = m["status"] or "-"
             st_item = QTableWidgetItem(status)
             color = _STATUS_HEX.get(status)
             if color:
                 st_item.setForeground(QColor(color))
-            self.qc_preview.setItem(row, 8, st_item)
+            self.qc_preview.setItem(row, 7, st_item)
 
             date_str = (
                 m["measured_at"].strftime("%Y-%m-%d")
                 if m["measured_at"] else "-"
             )
-            self.qc_preview.setItem(row, 9, QTableWidgetItem(date_str))
+            self.qc_preview.setItem(row, 8, QTableWidgetItem(date_str))
 
     def _render_preview_chart(self, sample_id: str, metrics: list):
         ax1, ax2 = self._prev_axes
@@ -515,7 +513,6 @@ class ReportsTab(QWidget):
                                     "total_amount": m.total_amount,
                                     "gqn_rin": m.gqn_rin,
                                     "avg_size": m.avg_size,
-                                    "molarity": m.molarity,
                                     "status": m.status,
                                     "measured_at": m.measured_at,
                                 }
@@ -709,7 +706,7 @@ def _build_report_figure(snap: dict, metrics: list) -> "plt.Figure":
 
     tbl_cols = ["Step", "Instrument", "Conc\n(ng/µl)", "Vol\n(µl)",
                 "Total\n(ng)", "GQN/\nRIN", "Avg Size\n(bp)",
-                "Molarity\n(nM)", "Status", "Date"]
+                "Status", "Date"]
 
     if metrics:
         tbl_data = []
@@ -724,7 +721,6 @@ def _build_report_figure(snap: dict, metrics: list) -> "plt.Figure":
                 _fmt(m["total_amount"]),
                 _fmt(m["gqn_rin"]),
                 _fmt(m["avg_size"], 0),
-                _fmt(m["molarity"]),
                 m["status"] or "-",
                 date_str,
             ])
@@ -904,7 +900,7 @@ def _write_excel(wb: "openpyxl.Workbook", sample_ids: List[str], snap_map: dict)
     qc_cols = ["Sample ID", "Step", "Instrument",
                "Conc (ng/ul)", "Vol (ul)", "Total (ng)",
                "260/280", "GQN/RIN", "Avg Size (bp)",
-               "Molarity (nM)", "Status", "Measured Date"]
+               "Status", "Measured Date"]
     _hdr(ws_qc, 1, qc_cols)
 
     qc_row = 2
@@ -927,16 +923,15 @@ def _write_excel(wb: "openpyxl.Workbook", sample_ids: List[str], snap_map: dict)
                     _cell(ws_qc, qc_row, 7, m.purity_260_280, alt)
                     _cell(ws_qc, qc_row, 8, m.gqn_rin, alt)
                     _cell(ws_qc, qc_row, 9, m.avg_size, alt)
-                    _cell(ws_qc, qc_row, 10, m.molarity, alt)
                     status = m.status or ""
                     s_fill = PatternFill("solid",
                                          fgColor=status_color_map.get(status, "9E9E9E"))
-                    c = _cell(ws_qc, qc_row, 11, status, s_fill)
+                    c = _cell(ws_qc, qc_row, 10, status, s_fill)
                     c.font = XlFont(bold=True, color="FFFFFF")
                     c.alignment = center
                     date_str = (m.measured_at.strftime("%Y-%m-%d")
                                 if m.measured_at else "")
-                    _cell(ws_qc, qc_row, 12, date_str, alt)
+                    _cell(ws_qc, qc_row, 11, date_str, alt)
                     qc_row += 1
         except Exception as e:
             logger.error(f"Excel QC row failed for {sid}: {e}")

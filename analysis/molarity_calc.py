@@ -4,17 +4,19 @@ Qubit 농도와 Femto Pulse Average Size를 이용하여 nM 계산
 """
 import logging
 from typing import Optional
-from config.settings import DNA_MW_PER_BP, RNA_MW_PER_BASE
 
 logger = logging.getLogger(__name__)
+
+_DNA_MW_PER_BP = 650    # g/mol per bp (average)
+_RNA_MW_PER_BASE = 330  # g/mol per base (average)
 
 
 class MolarityCalculator:
     """Molarity 계산 클래스"""
-    
+
     def __init__(self):
-        self.dna_mw_per_bp = DNA_MW_PER_BP  # 650 g/mol per bp
-        self.rna_mw_per_base = RNA_MW_PER_BASE  # 330 g/mol per base
+        self.dna_mw_per_bp = _DNA_MW_PER_BP
+        self.rna_mw_per_base = _RNA_MW_PER_BASE
     
     def calculate_molarity(
         self,
