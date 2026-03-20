@@ -38,6 +38,8 @@ class Sample(Base):
     material = Column(String(100))  # Blood, Tissue, Cultured Cell, FFPE, Saliva
     full_name = Column(String(200))  # Optional – 고객사 제공 명칭 등
     project = Column(String(200))    # Project name
+    parent_sample_id = Column(String(100))  # 분기 원본 샘플 ID
+    branch_type = Column(String(50))         # Re-extraction / Aliquot / Other
     source = Column(String(200))
     description = Column(String(500))
     created_at = Column(DateTime, default=datetime.now)

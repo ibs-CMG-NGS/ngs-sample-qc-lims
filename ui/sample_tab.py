@@ -9,6 +9,7 @@ from PyQt5.QtWidgets import (
     QLineEdit, QComboBox,
 )
 from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QFont
 import logging
 
 try:
@@ -30,10 +31,11 @@ from analysis.visualizer import load_electropherogram_traces, qc_visualizer
 logger = logging.getLogger(__name__)
 
 # Sample list columns
-SAMPLE_COLS = ["Sample ID", "Name", "Project", "Species", "Material", "Type", "Description", "Created"]
+SAMPLE_COLS = ["Sample ID", "Name", "Project", "Species", "Material", "Type", "Description", "Created", "Origin"]
 _COL_TYPE        = SAMPLE_COLS.index("Type")
 _COL_DESCRIPTION = SAMPLE_COLS.index("Description")
 _COL_CREATED     = SAMPLE_COLS.index("Created")
+_COL_ORIGIN      = SAMPLE_COLS.index("Origin")
 
 # QC detail columns
 QC_COLS = [
@@ -75,6 +77,11 @@ class SampleTab(QWidget):
         btn_edit = QPushButton("Edit Sample")
         btn_edit.clicked.connect(self._open_edit_sample)
         btn_bar.addWidget(btn_edit)
+
+        btn_reextract = QPushButton("Re-extract")
+        btn_reextract.setToolTip("선택한 샘플을 기반으로 재추출 샘플 등록")
+        btn_reextract.clicked.connect(self._open_reextract_sample)
+        btn_bar.addWidget(btn_reextract)
 
         btn_nanodrop = QPushButton("NanoDrop")
         btn_nanodrop.clicked.connect(self._open_nanodrop)
@@ -241,6 +248,22 @@ class SampleTab(QWidget):
                         row, _COL_CREATED, QTableWidgetItem(created)
                     )
 
+                    parent_id = getattr(s, 'parent_sample_id', None) or ""
+                    branch_type = getattr(s, 'branch_type', None) or ""
+                    origin_text = f"{parent_id} [{branch_type}]" if (parent_id and branch_type) else parent_id
+                    self.sample_table.setItem(
+                        row, _COL_ORIGIN, QTableWidgetItem(origin_text)
+                    )
+
+                    # 분기 샘플은 이탤릭체로 표시
+                    if parent_id:
+                        italic = QFont()
+                        italic.setItalic(True)
+                        for col in range(len(SAMPLE_COLS)):
+                            item = self.sample_table.item(row, col)
+                            if item:
+                                item.setFont(italic)
+
                 self._update_filter_options(sorted(types_seen))
 
         except Exception as e:
@@ -330,6 +353,10 @@ class SampleTab(QWidget):
         edit_action = QAction("Edit Sample", self)
         edit_action.triggered.connect(lambda: self._edit_sample_by_id(sample_id))
         menu.addAction(edit_action)
+
+        reextract_action = QAction("Re-extract from this sample", self)
+        reextract_action.triggered.connect(lambda: self._open_reextract_by_id(sample_id))
+        menu.addAction(reextract_action)
 
         menu.addSeparator()
 
@@ -584,6 +611,19 @@ class SampleTab(QWidget):
         if not sample_id:
             return
         dlg = SampleDialog(self, edit_sample_id=sample_id)
+        if dlg.exec_() == SampleDialog.Accepted:
+            self.refresh_samples()
+
+    def _open_reextract_sample(self):
+        """선택된 샘플을 부모로 하는 재추출 샘플 등록."""
+        sample_id = self._get_selected_sample_id()
+        if not sample_id:
+            return
+        self._open_reextract_by_id(sample_id)
+
+    def _open_reextract_by_id(self, parent_sample_id: str):
+        """지정 샘플을 부모로 하는 재추출 샘플 등록 다이얼로그."""
+        dlg = SampleDialog(self, parent_sample_id=parent_sample_id)
         if dlg.exec_() == SampleDialog.Accepted:
             self.refresh_samples()
 

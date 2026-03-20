@@ -63,6 +63,8 @@ class DatabaseManager:
             "ALTER TABLE samples ADD COLUMN material VARCHAR(100)",
             "ALTER TABLE samples ADD COLUMN full_name VARCHAR(200)",
             "ALTER TABLE samples ADD COLUMN project VARCHAR(200)",
+            "ALTER TABLE samples ADD COLUMN parent_sample_id VARCHAR(100)",
+            "ALTER TABLE samples ADD COLUMN branch_type VARCHAR(50)",
             "ALTER TABLE femtopulse_runs ADD COLUMN measured_at DATETIME",
             "ALTER TABLE qc_metrics ADD COLUMN index_no VARCHAR(50)",
         ]
@@ -394,3 +396,22 @@ def update_project(session, project_name: str, data: dict):
             setattr(proj, key, value)
     session.flush()
     return proj
+
+
+# ── Re-extraction lineage ──────────────────────────────────────────
+
+def get_children_by_sample(session, sample_id: str):
+    """특정 샘플을 부모로 하는 재추출 샘플 목록 (생성순)."""
+    from database.models import Sample
+    return (session.query(Sample)
+            .filter(Sample.parent_sample_id == sample_id)
+            .order_by(Sample.created_at)
+            .all())
+
+
+def get_re_extraction_count(session, sample_id: str) -> int:
+    """해당 샘플의 현재까지 재추출 횟수 (직계 자녀 수)."""
+    from database.models import Sample
+    return (session.query(Sample)
+            .filter(Sample.parent_sample_id == sample_id)
+            .count())

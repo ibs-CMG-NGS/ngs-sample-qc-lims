@@ -30,6 +30,8 @@ from database.db_manager import (
     get_project_by_name,
     add_project,
     update_project,
+    get_children_by_sample,
+    get_re_extraction_count,
 )
 
 __all__ = [
@@ -68,4 +70,6 @@ __all__ = [
     'get_project_by_name',
     'add_project',
     'update_project',
+    'get_children_by_sample',
+    'get_re_extraction_count',
 ]

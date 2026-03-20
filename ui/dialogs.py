@@ -24,6 +24,7 @@ from database import (
     add_femtopulse_run, add_smear_analysis,
     add_note, get_notes_by_sample, update_note, delete_note,
     get_all_projects, get_project_by_name, add_project, update_project,
+    get_all_samples, get_re_extraction_count,
 )
 from analysis.qc_judge import qc_judge
 from parsers import (
@@ -161,14 +162,17 @@ class SampleDialog(QDialog):
         edit_sample_id: 수정할 샘플 ID. None이면 신규 등록 모드.
     """
 
-    def __init__(self, parent=None, edit_sample_id=None):
+    def __init__(self, parent=None, edit_sample_id=None, parent_sample_id=None):
         super().__init__(parent)
         self._edit_sample_id = edit_sample_id
+        self._init_parent_id = parent_sample_id  # 재추출 모드 초기 부모
         self.setWindowTitle("Edit Sample" if edit_sample_id else "New Sample")
-        self.setMinimumWidth(400)
+        self.setMinimumWidth(420)
         self._build_ui()
         if edit_sample_id:
             self._load_sample(edit_sample_id)
+        elif parent_sample_id:
+            self._init_reextraction(parent_sample_id)
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -178,6 +182,24 @@ class SampleDialog(QDialog):
         self.sample_id_edit = QLineEdit()
         self.sample_id_edit.setPlaceholderText("Required")
         form.addRow("Sample ID:", self.sample_id_edit)
+
+        # 분기 원본 샘플 선택 (신규 등록 시만 표시)
+        self._branch_label = QLabel("Derived from:")
+        branch_row = QHBoxLayout()
+        self.parent_combo = QComboBox()
+        self.parent_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.parent_combo.activated.connect(self._on_parent_changed)
+        branch_row.addWidget(self.parent_combo)
+        self._branch_type_combo = QComboBox()
+        self._branch_type_combo.setFixedWidth(120)
+        for btype in ("Re-extraction", "Aliquot", "Other"):
+            self._branch_type_combo.addItem(btype)
+        self._branch_type_combo.setEnabled(False)  # 부모 선택 전 비활성
+        branch_row.addWidget(self._branch_type_combo)
+        self._branch_row_widget = QWidget()
+        self._branch_row_widget.setLayout(branch_row)
+        form.addRow(self._branch_label, self._branch_row_widget)
+        self._load_parent_combo()
 
         self.sample_name_edit = QLineEdit()
         self.sample_name_edit.setPlaceholderText("Optional (memo / alias)")
@@ -239,6 +261,63 @@ class SampleDialog(QDialog):
         layout.addWidget(buttons)
 
         self._load_projects()
+
+        # edit 모드에서는 분기 행 숨김
+        if self._edit_sample_id:
+            self._branch_label.hide()
+            self._branch_row_widget.hide()
+
+    def _load_parent_combo(self):
+        """모든 샘플 ID를 parent 콤보에 채운다."""
+        self.parent_combo.blockSignals(True)
+        self.parent_combo.clear()
+        self.parent_combo.addItem("(없음 / New sample)", "")
+        try:
+            with db_manager.session_scope() as session:
+                samples = get_all_samples(session)
+                for s in samples:
+                    self.parent_combo.addItem(s.sample_id, s.sample_id)
+        except Exception:
+            pass
+        self.parent_combo.blockSignals(False)
+
+    def _on_parent_changed(self, index: int):
+        """부모 샘플 선택 시 branch_type 활성화 + sample_id 자동 제안 + 속성 자동 채움."""
+        parent_id = self.parent_combo.currentData()
+        if not parent_id:
+            self._branch_type_combo.setEnabled(False)
+            return
+        self._branch_type_combo.setEnabled(True)
+        # 분기 번호 계산 (기존 자녀 수 기반, B2/B3/B4 ...)
+        try:
+            with db_manager.session_scope() as session:
+                count = get_re_extraction_count(session, parent_id)
+                parent = get_sample_by_id(session, parent_id)
+                suggested_id = f"{parent_id}-B{count + 2}"
+                # 부모 속성 자동 채움
+                if parent:
+                    proj = getattr(parent, 'project', None) or ""
+                    if proj and self.project_combo.findText(proj) == -1:
+                        self.project_combo.addItem(proj)
+                    self.project_combo.setCurrentText(proj)
+                    if parent.species:
+                        self.species_combo.setCurrentText(parent.species)
+                    if parent.material:
+                        self.material_combo.setCurrentText(parent.material)
+                    if parent.sample_type:
+                        idx = self.type_combo.findData(parent.sample_type)
+                        if idx >= 0:
+                            self.type_combo.setCurrentIndex(idx)
+        except Exception:
+            suggested_id = f"{parent_id}-B2"
+        self.sample_id_edit.setText(suggested_id)
+
+    def _init_reextraction(self, parent_sample_id: str):
+        """재추출 모드 초기화: 부모 샘플을 콤보에서 선택."""
+        idx = self.parent_combo.findData(parent_sample_id)
+        if idx >= 0:
+            self.parent_combo.setCurrentIndex(idx)
+            self._on_parent_changed(idx)
 
     def _load_projects(self):
         """projects 테이블에서 프로젝트 목록을 읽어 콤보박스에 채운다."""
@@ -323,6 +402,12 @@ class SampleDialog(QDialog):
                 if idx >= 0:
                     self.type_combo.setCurrentIndex(idx)
                 self.desc_edit.setPlainText(sample.description or "")
+                # 분기 샘플인 경우 title에 부모 + 분기 유형 표시
+                parent_id = getattr(sample, 'parent_sample_id', None)
+                btype = getattr(sample, 'branch_type', None)
+                if parent_id:
+                    label = f"{btype} of {parent_id}" if btype else f"branch of {parent_id}"
+                    self.setWindowTitle(f"Edit Sample  [{label}]")
         except Exception as e:
             logger.error(f"Failed to load sample: {e}")
 
@@ -340,6 +425,12 @@ class SampleDialog(QDialog):
         species_text = self.species_combo.currentText().strip()
         material_text = self.material_combo.currentText().strip()
 
+        parent_id = self.parent_combo.currentData() if not self._edit_sample_id else None
+        branch_type = (
+            self._branch_type_combo.currentText() if (not self._edit_sample_id and parent_id)
+            else None
+        )
+
         data = {
             "sample_name": self.sample_name_edit.text().strip() or None,
             "full_name": self.full_name_edit.text().strip() or None,
@@ -348,6 +439,8 @@ class SampleDialog(QDialog):
             "material": material_text or None,
             "sample_type": self.type_combo.currentData(),
             "description": self.desc_edit.toPlainText().strip() or None,
+            "parent_sample_id": parent_id or None,
+            "branch_type": branch_type,
         }
 
         try:
