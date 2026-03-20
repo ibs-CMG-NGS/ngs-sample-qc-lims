@@ -186,6 +186,104 @@ install.bat
 
 ---
 
+## 개발 환경 설정 (코드 수정·기여 목적)
+
+사용 목적이 아닌 **개발·수정** 목적으로 설치하는 경우 아래 단계를 추가로 진행합니다.
+
+### 1단계: Git 설치 및 설정
+
+1. [git-scm.com](https://git-scm.com/download/win) 에서 Git for Windows 설치
+2. 설치 후 사용자 정보 등록:
+   ```bat
+   git config --global user.name "Your Name"
+   git config --global user.email "your@email.com"
+   ```
+
+### 2단계: 소스코드 클론
+
+ZIP 다운로드 대신 반드시 Git으로 클론합니다 (push/pull을 위해):
+
+```bat
+git clone https://github.com/ibs-CMG-NGS/ngs-sample-qc-lims.git
+cd ngs-sample-qc-lims
+```
+
+> Private 저장소인 경우 GitHub Personal Access Token(PAT) 또는 SSH 키 설정이 필요합니다.
+> - PAT: GitHub → Settings → Developer settings → Personal access tokens → Generate new token
+> - 클론 시 비밀번호 대신 PAT를 입력
+
+### 3단계: Python 가상환경 및 패키지 설치
+
+```bat
+python -m venv venv
+venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+### 4단계: VSCode 설치 및 설정
+
+1. [code.visualstudio.com](https://code.visualstudio.com/) 에서 VSCode 설치
+2. 아래 익스텐션 설치 (VSCode 내 Extensions 탭에서 검색):
+
+   | 익스텐션 | 용도 |
+   |----------|------|
+   | Python (Microsoft) | 자동완성, 디버깅, 린팅 |
+   | Pylance | 타입 힌트, 코드 분석 |
+   | GitLens | Git 히스토리·blame 시각화 |
+
+3. VSCode에서 프로젝트 폴더 열기:
+   ```bat
+   code ngs-sample-qc-lims
+   ```
+
+4. Python 인터프리터 선택: `Ctrl+Shift+P` → "Python: Select Interpreter" → `venv\Scripts\python.exe` 선택
+
+### 5단계: Claude Code 설치 (AI 코딩 어시스턴트, 선택)
+
+Node.js가 필요합니다:
+
+1. [nodejs.org](https://nodejs.org/) 에서 Node.js LTS 설치
+2. Claude Code 설치:
+   ```bat
+   npm install -g @anthropic-ai/claude-code
+   ```
+3. 프로젝트 폴더에서 실행:
+   ```bat
+   cd ngs-sample-qc-lims
+   claude
+   ```
+
+### 개발 워크플로
+
+```bat
+REM 1. 최신 코드 받기
+git pull
+
+REM 2. 가상환경 활성화
+venv\Scripts\activate
+
+REM 3. 앱 실행 (코드 수정 후 확인)
+python main.py
+
+REM 4. 변경사항 커밋
+git add .
+git commit -m "설명"
+git push
+```
+
+### 데이터베이스 공유
+
+`data/lims.db`는 `.gitignore`에 포함되어 **Git으로 공유되지 않습니다.** PC 간 데이터 이전이 필요하면 파일을 직접 복사합니다:
+
+```bat
+REM 다른 PC → 이 PC로 복사
+copy \\other-pc\share\lims.db data\lims.db
+```
+
+> 두 PC에서 동시에 데이터를 입력하는 경우 나중에 병합이 필요하므로, 한 대를 주 입력용으로 지정하는 것을 권장합니다.
+
+---
+
 ## 디렉터리 구조
 
 ```
