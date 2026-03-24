@@ -55,15 +55,14 @@ class QCJudge:
             elif gqn < gqn_pass:
                 return "Warning"
         
-        # Library 단계에서는 Size도 체크
-        if step == 'Library Prep' and avg_size is not None:
-            size_criteria = criteria.get('library_size', {})
-            min_size = size_criteria.get('min', 300)
-            max_size = size_criteria.get('max', 700)
-            
-            if avg_size < min_size or avg_size > max_size:
-                return "Warning"
-        
+        # Library size 체크 — 현재 비활성화 (short-read/long-read 혼용으로 기준 미적용)
+        # if step == 'Library Prep' and avg_size is not None:
+        #     size_criteria = criteria.get('library_size', {})
+        #     min_size = size_criteria.get('min', 300)
+        #     max_size = size_criteria.get('max', 700)
+        #     if avg_size < min_size or avg_size > max_size:
+        #         return "Warning"
+
         # 농도 체크 (선택적)
         concentration = qc_data.get('concentration')
         if concentration is not None and concentration < 1.0:
