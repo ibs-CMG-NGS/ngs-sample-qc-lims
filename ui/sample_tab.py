@@ -78,8 +78,8 @@ class SampleTab(QWidget):
         btn_edit.clicked.connect(self._open_edit_sample)
         btn_bar.addWidget(btn_edit)
 
-        btn_reextract = QPushButton("Re-extract")
-        btn_reextract.setToolTip("선택한 샘플을 기반으로 재추출 샘플 등록")
+        btn_reextract = QPushButton("Branch Sample")
+        btn_reextract.setToolTip("선택한 샘플을 기반으로 분기 샘플 등록 (재추출/분주 등)")
         btn_reextract.clicked.connect(self._open_reextract_sample)
         btn_bar.addWidget(btn_reextract)
 
@@ -354,7 +354,7 @@ class SampleTab(QWidget):
         edit_action.triggered.connect(lambda: self._edit_sample_by_id(sample_id))
         menu.addAction(edit_action)
 
-        reextract_action = QAction("Re-extract from this sample", self)
+        reextract_action = QAction("Branch from this sample", self)
         reextract_action.triggered.connect(lambda: self._open_reextract_by_id(sample_id))
         menu.addAction(reextract_action)
 

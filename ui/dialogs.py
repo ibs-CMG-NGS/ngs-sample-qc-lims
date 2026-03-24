@@ -9,7 +9,7 @@ from PyQt5.QtWidgets import (
     QFileDialog, QTableWidget, QTableWidgetItem, QMessageBox,
     QHeaderView, QDoubleSpinBox, QTextEdit, QAbstractItemView,
     QDateEdit, QListWidget, QListWidgetItem, QSplitter,
-    QInputDialog, QCompleter, QSizePolicy,
+    QInputDialog, QCompleter, QSizePolicy, QWidget,
 )
 from PyQt5.QtCore import Qt, QDate
 from PyQt5.QtGui import QFont
