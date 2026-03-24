@@ -826,7 +826,7 @@ class FemtoPulseDialog(QDialog):
         folder_row.addWidget(browse_btn)
         layout.addLayout(folder_row)
 
-        # Step + Date row
+        # Step + Date + Project filter row
         step_row = QHBoxLayout()
         step_row.addWidget(QLabel("Step:"))
         self.step_combo = QComboBox()
@@ -840,6 +840,15 @@ class FemtoPulseDialog(QDialog):
         self.date_edit.setDate(QDate.currentDate())
         self.date_edit.setDisplayFormat("yyyy-MM-dd")
         step_row.addWidget(self.date_edit)
+        step_row.addSpacing(20)
+        step_row.addWidget(QLabel("Project:"))
+        self.project_filter_combo = QComboBox()
+        self.project_filter_combo.setMinimumWidth(160)
+        self.project_filter_combo.addItem("All", "")
+        for proj in self._db_projects:
+            self.project_filter_combo.addItem(proj, proj)
+        self.project_filter_combo.currentIndexChanged.connect(self._on_project_filter_changed)
+        step_row.addWidget(self.project_filter_combo)
         step_row.addStretch()
         layout.addLayout(step_row)
 
@@ -876,23 +885,46 @@ class FemtoPulseDialog(QDialog):
         layout.addWidget(buttons)
 
     def _load_db_samples(self):
-        """DB의 전체 샘플 목록을 미리 로드한다."""
+        """DB의 전체 샘플 목록 및 프로젝트 목록을 미리 로드한다."""
         try:
             with db_manager.session_scope() as session:
-                rows = (session.query(Sample.sample_id, Sample.sample_name)
+                rows = (session.query(Sample.sample_id, Sample.sample_name, Sample.project)
                         .order_by(Sample.sample_id).all())
-                self._db_sample_ids = [(r.sample_id, r.sample_name or "") for r in rows]
+                self._db_sample_ids = [
+                    (r.sample_id, r.sample_name or "", r.project or "")
+                    for r in rows
+                ]
+                projects = sorted({r.project for r in rows if r.project})
+                self._db_projects = projects
         except Exception as e:
             logger.warning(f"DB sample load failed: {e}")
             self._db_sample_ids = []
+            self._db_projects = []
+
+    def _filtered_samples(self):
+        """현재 프로젝트 필터에 맞는 샘플 목록 반환."""
+        proj = self.project_filter_combo.currentData()
+        if not proj:
+            return self._db_sample_ids
+        return [(sid, sname, p) for sid, sname, p in self._db_sample_ids if p == proj]
+
+    def _on_project_filter_changed(self):
+        """프로젝트 필터 변경 시 preview 테이블의 DB Sample ID 콤보를 갱신한다."""
+        if not self._quality_rows:
+            return
+        for row, r in enumerate(self._quality_rows):
+            file_sid = r.get('sample_id', '')
+            combo = self._make_sample_combo(file_sid)
+            self.preview_table.setCellWidget(row, 2, combo)
 
     def _make_sample_combo(self, auto_match_id: str = "") -> QComboBox:
-        """DB 샘플 ID 선택용 QComboBox를 생성하고 자동 매칭을 시도한다."""
+        """DB 샘플 ID 선택용 QComboBox를 생성하고 자동 매칭을 시도한다.
+        현재 프로젝트 필터가 적용된 샘플 목록을 사용한다."""
         combo = QComboBox()
         combo.setEditable(True)
         combo.addItem("")
         sid_list = []
-        for sid, sname in self._db_sample_ids:
+        for sid, sname, _ in self._filtered_samples():
             combo.addItem(sid)
             display = f"{sid}  {sname}".strip()
             combo.setItemData(combo.count() - 1, display, Qt.ToolTipRole)
