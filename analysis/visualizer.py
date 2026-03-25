@@ -266,6 +266,7 @@ class QCVisualizer:
                 tick_times     = list(cal_times_arr)
                 tick_bp_labels = [p[0] for p in pts]
 
+        max_data_time = None  # 실제 플롯된 데이터의 최대 x (migration time)
         for i, trace in enumerate(traces):
             step = trace.get('step', f'Step {i + 1}')
             x_bp = trace.get('time_sec') if trace.get('time_sec') is not None else trace.get('size_bp', [])
@@ -278,6 +279,9 @@ class QCVisualizer:
                 else:
                     x = np.asarray(x_bp, dtype=float)
                 ax.plot(x, rfu, label=step, color=colors[i], linewidth=1.5)
+                x_max = float(np.max(x))
+                if max_data_time is None or x_max > max_data_time:
+                    max_data_time = x_max
 
         # Ticks at calibration migration-time positions, labeled with bp sizes
         if tick_times:
@@ -296,11 +300,14 @@ class QCVisualizer:
                 ax.axvline(t, color='gray', linewidth=0.5,
                            linestyle='--', alpha=0.35)
 
-            # Clip to calibration time range with small margins
+            # X축 범위: 왼쪽은 LM 앞 2% 여백
+            # 오른쪽은 실제 데이터 끝 vs 165kb 마커 중 큰 쪽 + 소폭 여백
             span = max(tick_times) - min(tick_times)
-            margin = span * 0.02
-            ax.set_xlim(left=min(tick_times) - margin,
-                        right=max(tick_times) + margin)
+            left_margin = span * 0.02
+            right_end = max(max_data_time or 0, max(tick_times))
+            right_margin = span * 0.01
+            ax.set_xlim(left=min(tick_times) - left_margin,
+                        right=right_end + right_margin)
 
         ax.set_xlabel('Size (bp)  [migration time axis, calibrated by ladder]',
                       fontsize=10, fontweight='bold')
