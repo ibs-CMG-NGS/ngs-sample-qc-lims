@@ -266,6 +266,21 @@ class QCVisualizer:
                 tick_times     = list(cal_times_arr)
                 tick_bp_labels = [p[0] for p in pts]
 
+        def _bp_to_time(x_bp_arr):
+            """bp → migration time 변환. calibration 범위 밖은 선형 외삽."""
+            if cal_bps_arr is None:
+                return np.asarray(x_bp_arr, dtype=float)
+            # 보간 (범위 내)
+            x_interp = np.interp(x_bp_arr, cal_bps_arr, cal_times_arr)
+            # 오른쪽 외삽: 마지막 두 calibration 포인트의 기울기 사용
+            if len(cal_bps_arr) >= 2:
+                slope = ((cal_times_arr[-1] - cal_times_arr[-2]) /
+                         (cal_bps_arr[-1] - cal_bps_arr[-2]))
+                mask = np.asarray(x_bp_arr) > cal_bps_arr[-1]
+                x_interp[mask] = (cal_times_arr[-1] +
+                                  slope * (np.asarray(x_bp_arr)[mask] - cal_bps_arr[-1]))
+            return x_interp
+
         max_data_time = None  # 실제 플롯된 데이터의 최대 x (migration time)
         for i, trace in enumerate(traces):
             step = trace.get('step', f'Step {i + 1}')
@@ -274,8 +289,7 @@ class QCVisualizer:
 
             if len(x_bp) > 0 and len(rfu) > 0:
                 if cal_bps_arr is not None:
-                    # Convert bp → migration time for ProAnalysis-style non-linear spacing
-                    x = np.interp(x_bp, cal_bps_arr, cal_times_arr)
+                    x = _bp_to_time(np.asarray(x_bp, dtype=float))
                 else:
                     x = np.asarray(x_bp, dtype=float)
                 ax.plot(x, rfu, label=step, color=colors[i], linewidth=1.5)
