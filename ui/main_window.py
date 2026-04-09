@@ -134,6 +134,14 @@ class MainWindow(QMainWindow):
         rejudge_action.triggered.connect(self._rejudge_all_qc)
         tools_menu.addAction(rejudge_action)
 
+        revio_action = QAction('&Revio Run Designer…', self)
+        revio_action.triggered.connect(self._open_revio_designer)
+        tools_menu.addAction(revio_action)
+
+        seq_import_action = QAction('&Import Sequencing QC…', self)
+        seq_import_action.triggered.connect(self._open_seq_import)
+        tools_menu.addAction(seq_import_action)
+
         tools_menu.addSeparator()
 
         # Google Sheets 서브메뉴
@@ -278,6 +286,20 @@ class MainWindow(QMainWindow):
         from ui.dilution_calc_dialog import DilutionCalcDialog
         dlg = DilutionCalcDialog(self)
         dlg.exec_()
+
+    def _open_revio_designer(self):
+        from ui.revio_dialog import RevioRunDesignerDialog
+        dlg = RevioRunDesignerDialog(self)
+        dlg.exec_()
+
+    def _open_seq_import(self):
+        from ui.sequencing_result_dialog import SequencingResultDialog
+        dlg = SequencingResultDialog(self)
+        if dlg.exec_() == SequencingResultDialog.Accepted:
+            # Sample 탭 seq 결과 갱신
+            sample_tab = self.tabs.widget(1)
+            if hasattr(sample_tab, '_selected_sample_id') and sample_tab._selected_sample_id:
+                sample_tab._load_seq_results(sample_tab._selected_sample_id)
 
     def _rejudge_all_qc(self):
         """모든 QCMetric 레코드에 판정 로직 재실행."""

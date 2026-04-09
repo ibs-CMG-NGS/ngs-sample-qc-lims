@@ -24,8 +24,10 @@ from database import (
     db_manager, get_all_samples, get_latest_qc_metric,
     get_qc_metrics_by_sample, delete_qc_metric, delete_sample,
     get_smear_analyses_by_sample,
+    get_sequencing_results_by_sample, delete_sequencing_result,
 )
 from ui.dialogs import SampleDialog, NanoDropDialog, QubitDialog, FemtoPulseDialog, NoteDialog
+from ui.sequencing_result_dialog import SequencingResultDialog
 from analysis.visualizer import load_electropherogram_traces, qc_visualizer
 
 logger = logging.getLogger(__name__)
@@ -36,6 +38,14 @@ _COL_TYPE        = SAMPLE_COLS.index("Type")
 _COL_DESCRIPTION = SAMPLE_COLS.index("Description")
 _COL_CREATED     = SAMPLE_COLS.index("Created")
 _COL_ORIGIN      = SAMPLE_COLS.index("Origin")
+
+# Sequencing result columns (하단 서브테이블)
+SEQ_RESULT_COLS = [
+    "Run ID", "SMRT Cell", "Barcode",
+    "Yield (Gb)", "Coverage (×)", "N50 (kb)", "Mean Len (kb)",
+    "Quality (Q)", "Q30+ (%)", "P1 (%)",
+    "Missing Adp (%)", "Ctrl Reads", "Status", "Date",
+]
 
 # QC detail columns
 QC_COLS = [
@@ -59,7 +69,8 @@ class SampleTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._selected_sample_id = None
-        self._qc_metric_ids = []  # QC 테이블 행별 (metric_id, instrument)
+        self._qc_metric_ids = []       # QC 테이블 행별 (metric_id, instrument)
+        self._seq_result_ids = []      # Sequencing 테이블 행별 result_id
         self._build_ui()
         self.refresh_samples()
 
@@ -125,9 +136,16 @@ class SampleTab(QWidget):
         filter_bar = QHBoxLayout()
         filter_bar.addWidget(QLabel("Search:"))
         self.filter_edit = QLineEdit()
-        self.filter_edit.setPlaceholderText("Sample ID / Name / Project...")
+        self.filter_edit.setPlaceholderText("Sample ID / Name / Project / Origin...")
         self.filter_edit.textChanged.connect(self._apply_filter)
-        filter_bar.addWidget(self.filter_edit)
+        filter_bar.addWidget(self.filter_edit, stretch=1)
+
+        filter_bar.addWidget(QLabel("Project:"))
+        self.filter_project_combo = QComboBox()
+        self.filter_project_combo.setMinimumWidth(160)
+        self.filter_project_combo.addItem("All Projects")
+        self.filter_project_combo.currentTextChanged.connect(self._apply_filter)
+        filter_bar.addWidget(self.filter_project_combo)
 
         filter_bar.addWidget(QLabel("Type:"))
         self.filter_type_combo = QComboBox()
@@ -135,11 +153,16 @@ class SampleTab(QWidget):
         self.filter_type_combo.currentTextChanged.connect(self._apply_filter)
         filter_bar.addWidget(self.filter_type_combo)
 
+        filter_bar.addWidget(QLabel("Origin:"))
+        self.filter_branched_combo = QComboBox()
+        self.filter_branched_combo.addItems(["All", "Branched only", "Original only"])
+        self.filter_branched_combo.currentTextChanged.connect(self._apply_filter)
+        filter_bar.addWidget(self.filter_branched_combo)
+
         btn_clear_filter = QPushButton("Clear")
         btn_clear_filter.setFixedWidth(55)
         btn_clear_filter.clicked.connect(self._clear_filter)
         filter_bar.addWidget(btn_clear_filter)
-        filter_bar.addStretch()
         top_layout.addLayout(filter_bar)
 
         self.sample_table = QTableWidget()
@@ -161,27 +184,61 @@ class SampleTab(QWidget):
 
         splitter.addWidget(top_widget)
 
-        # --- Bottom: QC detail ---
+        # --- Bottom: QC detail + Sequencing Results (수직 분할) ---
         bottom_widget = QWidget()
         bottom_layout = QVBoxLayout(bottom_widget)
         bottom_layout.setContentsMargins(0, 0, 0, 0)
+        bottom_layout.setSpacing(0)
+
+        bottom_splitter = QSplitter(Qt.Vertical)
+        self.bottom_splitter = bottom_splitter
+
+        # QC Metrics 서브패널
+        qc_panel = QWidget()
+        qc_layout = QVBoxLayout(qc_panel)
+        qc_layout.setContentsMargins(0, 0, 0, 0)
+        qc_layout.setSpacing(2)
 
         self.detail_label = QLabel("QC Details")
-        bottom_layout.addWidget(self.detail_label)
+        qc_layout.addWidget(self.detail_label)
 
         self.qc_table = QTableWidget()
         self.qc_table.setColumnCount(len(QC_COLS))
         self.qc_table.setHorizontalHeaderLabels(QC_COLS)
         self.qc_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.qc_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.qc_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.Interactive
-        )
+        self.qc_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.qc_table.horizontalHeader().setStretchLastSection(True)
         self.qc_table.doubleClicked.connect(self._on_qc_double_click)
         self.qc_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.qc_table.customContextMenuRequested.connect(self._on_qc_context_menu)
-        bottom_layout.addWidget(self.qc_table)
+        qc_layout.addWidget(self.qc_table)
+        bottom_splitter.addWidget(qc_panel)
+
+        # Sequencing Results 서브패널
+        seq_panel = QWidget()
+        seq_layout = QVBoxLayout(seq_panel)
+        seq_layout.setContentsMargins(0, 0, 0, 0)
+        seq_layout.setSpacing(2)
+
+        self.seq_label = QLabel("Sequencing Results")
+        seq_layout.addWidget(self.seq_label)
+
+        self.seq_table = QTableWidget()
+        self.seq_table.setColumnCount(len(SEQ_RESULT_COLS))
+        self.seq_table.setHorizontalHeaderLabels(SEQ_RESULT_COLS)
+        self.seq_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.seq_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.seq_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.seq_table.horizontalHeader().setStretchLastSection(True)
+        self.seq_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.seq_table.customContextMenuRequested.connect(self._on_seq_context_menu)
+        seq_layout.addWidget(self.seq_table)
+        bottom_splitter.addWidget(seq_panel)
+
+        bottom_splitter.setStretchFactor(0, 3)
+        bottom_splitter.setStretchFactor(1, 2)
+        bottom_layout.addWidget(bottom_splitter)
 
         splitter.addWidget(bottom_widget)
 
@@ -197,14 +254,17 @@ class SampleTab(QWidget):
         self.sample_table.setSortingEnabled(False)
         self.sample_table.setRowCount(0)
         self.qc_table.setRowCount(0)
+        self.seq_table.setRowCount(0)
         self._selected_sample_id = None
         self.detail_label.setText("QC Details")
+        self.seq_label.setText("Sequencing Results")
 
         try:
             with db_manager.session_scope() as session:
                 samples = get_all_samples(session)
                 self.sample_table.setRowCount(len(samples))
-                types_seen = set()
+                types_seen    = set()
+                projects_seen = set()
 
                 for row, s in enumerate(samples):
                     self.sample_table.setItem(
@@ -228,6 +288,10 @@ class SampleTab(QWidget):
                             getattr(s, 'material', None) or ""
                         )
                     )
+                    project_val = getattr(s, 'project', None) or ""
+                    if project_val:
+                        projects_seen.add(project_val)
+
                     type_val = s.sample_type or ""
                     self.sample_table.setItem(
                         row, _COL_TYPE, QTableWidgetItem(type_val)
@@ -248,23 +312,49 @@ class SampleTab(QWidget):
                         row, _COL_CREATED, QTableWidgetItem(created)
                     )
 
-                    parent_id = getattr(s, 'parent_sample_id', None) or ""
+                    parent_id   = getattr(s, 'parent_sample_id', None) or ""
                     branch_type = getattr(s, 'branch_type', None) or ""
-                    origin_text = f"{parent_id} [{branch_type}]" if (parent_id and branch_type) else parent_id
-                    self.sample_table.setItem(
-                        row, _COL_ORIGIN, QTableWidgetItem(origin_text)
+                    origin_text = (
+                        f"↳ {parent_id}  [{branch_type}]" if branch_type
+                        else (f"↳ {parent_id}" if parent_id else "")
                     )
+                    origin_item = QTableWidgetItem(origin_text)
+                    self.sample_table.setItem(row, _COL_ORIGIN, origin_item)
 
-                    # 분기 샘플은 이탤릭체로 표시
+                    # 분기 샘플 시각화
                     if parent_id:
+                        from PyQt5.QtGui import QColor, QBrush
+
+                        # 배경색: branch_type 별로 구분
+                        _branch_bg = {
+                            "Re-extraction": QColor("#FFF3E0"),  # 연주황
+                            "Aliquot":       QColor("#E8F5E9"),  # 연초록
+                        }
+                        bg = _branch_bg.get(branch_type, QColor("#EEF2FF"))  # 기본 연청
+
+                        # Origin 컬럼: branch_type 색상 + 볼드
+                        _branch_fg = {
+                            "Re-extraction": "#E65100",
+                            "Aliquot":       "#2E7D32",
+                        }
+                        fg_hex = _branch_fg.get(branch_type, "#1565C0")
+                        origin_item.setForeground(QColor(fg_hex))
+                        bold_italic = QFont()
+                        bold_italic.setBold(True)
+                        origin_item.setFont(bold_italic)
+
+                        # 나머지 컬럼: 배경색 + 이탤릭
                         italic = QFont()
                         italic.setItalic(True)
                         for col in range(len(SAMPLE_COLS)):
                             item = self.sample_table.item(row, col)
                             if item:
-                                item.setFont(italic)
+                                item.setBackground(QBrush(bg))
+                                if col != _COL_ORIGIN:
+                                    item.setFont(italic)
 
                 self._update_filter_options(sorted(types_seen))
+                self._update_project_filter_options(sorted(projects_seen))
 
         except Exception as e:
             logger.error(f"Failed to load samples: {e}")
@@ -286,20 +376,34 @@ class SampleTab(QWidget):
         self.filter_type_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self.filter_type_combo.blockSignals(False)
 
+    def _update_project_filter_options(self, projects: list):
+        """Project 필터 콤보박스를 현재 데이터에 맞게 갱신."""
+        current = self.filter_project_combo.currentText()
+        self.filter_project_combo.blockSignals(True)
+        self.filter_project_combo.clear()
+        self.filter_project_combo.addItem("All Projects")
+        for p in projects:
+            self.filter_project_combo.addItem(p)
+        idx = self.filter_project_combo.findText(current)
+        self.filter_project_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.filter_project_combo.blockSignals(False)
+
     def _apply_filter(self):
         """현재 필터 조건에 맞지 않는 행을 숨김."""
-        text = self.filter_edit.text().strip().lower()
-        type_filter = self.filter_type_combo.currentText()
+        text            = self.filter_edit.text().strip().lower()
+        type_filter     = self.filter_type_combo.currentText()
+        project_filter  = self.filter_project_combo.currentText()
+        branched_filter = self.filter_branched_combo.currentText()
 
         for row in range(self.sample_table.rowCount()):
             show = True
 
             if text:
-                # Sample ID(0), Name(1), Project(2) 에서 검색
+                # Sample ID(0), Name(1), Project(2), Origin 에서 검색
                 match = any(
                     (item := self.sample_table.item(row, col)) and
                     text in item.text().lower()
-                    for col in (0, 1, 2)
+                    for col in (0, 1, 2, _COL_ORIGIN)
                 )
                 if not match:
                     show = False
@@ -309,12 +413,27 @@ class SampleTab(QWidget):
                 if not type_item or type_item.text() != type_filter:
                     show = False
 
+            if show and project_filter != "All Projects":
+                proj_item = self.sample_table.item(row, 2)
+                if not proj_item or proj_item.text() != project_filter:
+                    show = False
+
+            if show and branched_filter != "All":
+                origin_item = self.sample_table.item(row, _COL_ORIGIN)
+                is_branched = bool(origin_item and origin_item.text().strip())
+                if branched_filter == "Branched only" and not is_branched:
+                    show = False
+                elif branched_filter == "Original only" and is_branched:
+                    show = False
+
             self.sample_table.setRowHidden(row, not show)
 
     def _clear_filter(self):
         """필터 초기화."""
         self.filter_edit.clear()
         self.filter_type_combo.setCurrentIndex(0)
+        self.filter_project_combo.setCurrentIndex(0)
+        self.filter_branched_combo.setCurrentIndex(0)
 
     def get_visible_sample_ids(self) -> list[str]:
         """현재 필터 조건에 의해 보이는 샘플 ID 목록."""
@@ -490,6 +609,7 @@ class SampleTab(QWidget):
         sample_id = item.text()
         self._selected_sample_id = sample_id
         self._load_qc_details(sample_id)
+        self._load_seq_results(sample_id)
 
     def _load_qc_details(self, sample_id):
         """선택된 샘플의 QC metrics를 로드하여 하단 테이블에 표시."""
@@ -863,16 +983,108 @@ class SampleTab(QWidget):
 
         dlg.exec_()
 
+    def _load_seq_results(self, sample_id: str):
+        """선택된 샘플의 시퀀싱 결과를 로드하여 seq_table에 표시."""
+        self.seq_label.setText(f"Sequencing Results — {sample_id}")
+        self.seq_table.setRowCount(0)
+        self._seq_result_ids = []
+
+        try:
+            with db_manager.session_scope() as session:
+                results = get_sequencing_results_by_sample(session, sample_id)
+                if not results:
+                    return
+
+                self.seq_table.setRowCount(len(results))
+                for row, r in enumerate(results):
+                    self._seq_result_ids.append(r.id)
+
+                    def _item(val, center=True):
+                        txt = str(val) if val is not None else '-'
+                        it = QTableWidgetItem(txt)
+                        if center:
+                            it.setTextAlignment(Qt.AlignCenter)
+                        return it
+
+                    def _fmt(val, decimals=1):
+                        return f"{val:.{decimals}f}" if val is not None else '-'
+
+                    self.seq_table.setItem(row, 0, _item(r.run_id or '-', center=False))
+                    self.seq_table.setItem(row, 1, _item(r.smrt_cell))
+                    self.seq_table.setItem(row, 2, _item(r.barcode_id))
+                    self.seq_table.setItem(row, 3, _item(_fmt(r.hifi_yield_gb)))
+                    self.seq_table.setItem(row, 4, _item(_fmt(r.coverage_x)))
+                    self.seq_table.setItem(row, 5, _item(_fmt(r.read_length_n50_kb)))
+                    self.seq_table.setItem(row, 6, _item(_fmt(r.read_length_mean_kb)))
+                    self.seq_table.setItem(row, 7, _item(_fmt(r.read_quality_q, 0)))
+                    self.seq_table.setItem(row, 8, _item(_fmt(r.q30_pct)))
+                    self.seq_table.setItem(row, 9, _item(_fmt(r.zmw_p1_pct)))
+                    self.seq_table.setItem(row, 10, _item(_fmt(r.missing_adapter_pct)))
+                    self.seq_table.setItem(row, 11, _item(str(r.control_reads) if r.control_reads is not None else '-'))
+
+                    status = r.status or 'No Data'
+                    from config.settings import STATUS_COLORS
+                    from PyQt5.QtGui import QColor
+                    status_item = QTableWidgetItem(status)
+                    status_item.setTextAlignment(Qt.AlignCenter)
+                    color = STATUS_COLORS.get(status)
+                    if color:
+                        status_item.setForeground(QColor(color))
+                    bold = QFont(); bold.setBold(True)
+                    status_item.setFont(bold)
+                    self.seq_table.setItem(row, 12, status_item)
+
+                    date_str = r.measured_at.strftime("%Y-%m-%d") if r.measured_at else '-'
+                    self.seq_table.setItem(row, 13, _item(date_str))
+
+                self.seq_table.resizeColumnsToContents()
+
+        except Exception as e:
+            logger.error(f"Failed to load sequencing results: {e}")
+
+    def _on_seq_context_menu(self, pos):
+        """Sequencing Results 테이블 우클릭 메뉴."""
+        row = self.seq_table.rowAt(pos.y())
+        if row < 0 or row >= len(getattr(self, '_seq_result_ids', [])):
+            return
+        result_id = self._seq_result_ids[row]
+
+        menu = QMenu(self)
+        del_action = QAction("Delete", self)
+        del_action.triggered.connect(lambda: self._delete_seq_result(result_id))
+        menu.addAction(del_action)
+        menu.exec_(self.seq_table.viewport().mapToGlobal(pos))
+
+    def _delete_seq_result(self, result_id: int):
+        reply = QMessageBox.question(
+            self, "Delete", "이 시퀀싱 결과를 삭제하시겠습니까?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            with db_manager.session_scope() as session:
+                delete_sequencing_result(session, result_id)
+            if self._selected_sample_id:
+                self._load_seq_results(self._selected_sample_id)
+        except Exception as e:
+            logger.error(f"Delete seq result failed: {e}")
+            QMessageBox.critical(self, "Error", f"삭제 실패:\n{e}")
+
     # ── GUI 상태 저장/복원 ────────────────────────────────────────────
 
     def save_gui_state(self, settings):
         from config.gui_state import save_table_widths, save_splitter
         save_table_widths(settings, "SampleTab/sampleTableWidths", self.sample_table)
         save_table_widths(settings, "SampleTab/qcTableWidths",     self.qc_table)
+        save_table_widths(settings, "SampleTab/seqTableWidths",    self.seq_table)
         save_splitter(settings,     "SampleTab/splitterState",     self.splitter)
+        save_splitter(settings,     "SampleTab/bottomSplitterState", self.bottom_splitter)
 
     def restore_gui_state(self, settings):
         from config.gui_state import restore_table_widths, restore_splitter
         restore_table_widths(settings, "SampleTab/sampleTableWidths", self.sample_table)
         restore_table_widths(settings, "SampleTab/qcTableWidths",     self.qc_table)
+        restore_table_widths(settings, "SampleTab/seqTableWidths",    self.seq_table)
         restore_splitter(settings,     "SampleTab/splitterState",     self.splitter)
+        restore_splitter(settings,     "SampleTab/bottomSplitterState", self.bottom_splitter)

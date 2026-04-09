@@ -29,8 +29,40 @@ try:
     import matplotlib
     matplotlib.use("Qt5Agg")
     import matplotlib.pyplot as plt
+    import matplotlib.ticker as mticker
     from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
     from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavToolbar
+
+    # ── 전역 스타일 설정 ──────────────────────────────────────────────
+    plt.rcParams.update({
+        "figure.facecolor":      "#FFFFFF",
+        "axes.facecolor":        "#F8F9FA",
+        "axes.edgecolor":        "#CCCCCC",
+        "axes.linewidth":        0.8,
+        "axes.grid":             True,
+        "axes.grid.axis":        "y",
+        "grid.color":            "#E0E0E0",
+        "grid.linewidth":        0.6,
+        "axes.spines.top":       False,
+        "axes.spines.right":     False,
+        "axes.titlesize":        10,
+        "axes.titleweight":      "bold",
+        "axes.titlepad":         8,
+        "axes.labelsize":        8,
+        "axes.labelcolor":       "#444444",
+        "xtick.labelsize":       8,
+        "ytick.labelsize":       8,
+        "xtick.color":           "#555555",
+        "ytick.color":           "#555555",
+        "legend.fontsize":       7.5,
+        "legend.framealpha":     0.85,
+        "legend.edgecolor":      "#CCCCCC",
+        "legend.borderpad":      0.5,
+        "font.family":           ["Malgun Gothic", "DejaVu Sans", "sans-serif"],
+        "lines.linewidth":       2.0,
+        "lines.markersize":      6,
+        "patch.linewidth":       0.5,
+    })
     HAS_MPL = True
 except ImportError:
     HAS_MPL = False
@@ -49,9 +81,13 @@ _STATUS_COLOR = {
     "Fail":    STATUS_COLORS["Fail"],
     "No Data": "#9E9E9E",
 }
-_STEP_COLORS = [
-    "#1565C0", "#2E7D32", "#6A1B9A", "#E65100", "#00695C",
-    "#AD1457", "#37474F", "#F57F17",
+
+# 다중 샘플용 색상 팔레트 (colorblind-friendly, 20색 순환)
+_SAMPLE_PALETTE = [
+    "#2196F3", "#4CAF50", "#FF5722", "#9C27B0", "#009688",
+    "#F44336", "#3F51B5", "#FF9800", "#00BCD4", "#8BC34A",
+    "#E91E63", "#795548", "#607D8B", "#CDDC39", "#FFC107",
+    "#673AB7", "#03A9F4", "#76FF03", "#FF4081", "#00E5FF",
 ]
 
 # ── 지표 정의 ──────────────────────────────────────────────────────
@@ -83,29 +119,43 @@ def _fmt(val, d=2) -> str:
 class _ChartPanel(QFrame):
     """제목 + 컨트롤 바 + matplotlib 캔버스를 묶는 패널."""
 
-    def __init__(self, title: str, figsize=(5.5, 3.8), dpi=90, parent=None):
+    def __init__(self, title: str, figsize=(5.5, 3.8), dpi=92, parent=None):
         super().__init__(parent)
         self.setFrameShape(QFrame.StyledPanel)
+        self.setStyleSheet(
+            "QFrame { background-color: #FFFFFF; border: 1px solid #E0E0E0;"
+            " border-radius: 6px; }"
+        )
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(6, 6, 6, 4)
+        layout.setContentsMargins(10, 8, 10, 8)
         layout.setSpacing(4)
 
-        # 제목
+        # 타이틀 바 (회색 배경)
+        title_bar = QWidget()
+        title_bar.setStyleSheet(
+            "background-color: #F5F5F5; border-radius: 4px; padding: 2px 4px;"
+        )
+        title_layout = QHBoxLayout(title_bar)
+        title_layout.setContentsMargins(6, 2, 6, 2)
+        title_layout.setSpacing(8)
+
         lbl = QLabel(title)
         f = QFont(); f.setBold(True); f.setPointSize(9)
         lbl.setFont(f)
-        layout.addWidget(lbl)
+        lbl.setStyleSheet("background: transparent; color: #333333;")
+        title_layout.addWidget(lbl)
 
-        # 컨트롤 슬롯 (서브클래스가 채움)
+        # 컨트롤 슬롯 (우측 정렬)
+        title_layout.addStretch()
         self.ctrl_layout = QHBoxLayout()
         self.ctrl_layout.setSpacing(6)
-        layout.addLayout(self.ctrl_layout)
+        title_layout.addLayout(self.ctrl_layout)
+        layout.addWidget(title_bar)
 
         # matplotlib 캔버스
         if HAS_MPL:
             self.fig, self.ax = plt.subplots(figsize=figsize, dpi=dpi)
-            self.fig.patch.set_facecolor("#FAFAFA")
             self.canvas = FigureCanvas(self.fig)
             self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             layout.addWidget(self.canvas, 1)
@@ -114,11 +164,11 @@ class _ChartPanel(QFrame):
 
     def _clear(self):
         self.ax.clear()
-        self.ax.set_facecolor("#FAFAFA")
+        self.ax.set_facecolor("#F8F9FA")
 
     def _draw(self):
         try:
-            self.fig.tight_layout(pad=0.6)
+            self.fig.tight_layout(pad=0.8)
         except Exception:
             pass
         self.canvas.draw()
@@ -126,7 +176,8 @@ class _ChartPanel(QFrame):
     def _no_data(self, msg="데이터 없음"):
         self._clear()
         self.ax.text(0.5, 0.5, msg, ha="center", va="center",
-                     transform=self.ax.transAxes, color="#9E9E9E", fontsize=11)
+                     transform=self.ax.transAxes, color="#BDBDBD", fontsize=12,
+                     fontweight="bold")
         self.ax.axis("off")
         self._draw()
 
@@ -360,36 +411,51 @@ class AnalysisTab(QWidget):
             return
 
         x = np.arange(len(sample_ids))
-        bars = ax.bar(x, values, color=colors, edgecolor="white", linewidth=0.8, width=0.6)
+        # 샘플 수에 따라 bar width 조절
+        bar_w = max(0.3, min(0.65, 6 / max(len(sample_ids), 1)))
+        bars = ax.bar(x, values, color=colors, edgecolor="white",
+                      linewidth=0.6, width=bar_w, zorder=3)
 
-        # 값 레이블
-        for bar, val in zip(bars, values):
-            ax.text(bar.get_x() + bar.get_width() / 2,
-                    bar.get_height() + max(values) * 0.01,
-                    f"{val:.1f}", ha="center", va="bottom", fontsize=8)
+        # 값 레이블 (바 수가 많으면 생략)
+        if len(values) <= 20:
+            for bar, val in zip(bars, values):
+                ax.text(bar.get_x() + bar.get_width() / 2,
+                        bar.get_height() + max(values) * 0.015,
+                        f"{val:.1f}", ha="center", va="bottom", fontsize=7.5,
+                        color="#333333")
 
         # QC 기준선
+        from matplotlib.patches import Patch
+        thresh_handles = []
         for thresh_val, thresh_label, thresh_color in self._get_thresholds(metric):
             ax.axhline(thresh_val, color=thresh_color, linestyle="--",
-                       linewidth=1.2, alpha=0.8, label=f"{thresh_label} ({thresh_val})")
-            ax.legend(fontsize=7, loc="upper right", framealpha=0.8)
+                       linewidth=1.4, alpha=0.9, zorder=4)
+            thresh_handles.append(
+                Patch(facecolor=thresh_color, alpha=0.7,
+                      label=f"{thresh_label} ≥{thresh_val}")
+            )
 
         ax.set_xticks(x)
-        ax.set_xticklabels(sample_ids, rotation=20, ha="right", fontsize=8)
-        ax.set_ylabel(label, fontsize=8)
-        ax.set_title(f"{step}  —  {label}", fontsize=9, fontweight="bold")
-        ax.spines[["top", "right"]].set_visible(False)
+        # 샘플 ID를 짧게 표시
+        short_labels = [sid.split("-")[-1] if len(sid) > 14 else sid
+                        for sid in sample_ids]
+        ax.set_xticklabels(short_labels, rotation=35, ha="right", fontsize=7.5)
+        ax.set_ylabel(label, fontsize=8.5)
+        ax.set_title(f"{step}  ·  {label}", fontsize=10, fontweight="bold",
+                     color="#222222")
+        ax.set_xlim(-0.6, len(sample_ids) - 0.4)
+        ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.1f"))
 
-        # 범례 (상태 색상)
-        from matplotlib.patches import Patch
-        legend_handles = [
-            Patch(facecolor=c, label=s)
+        # 상태 색상 범례 + 기준선 범례
+        status_handles = [
+            Patch(facecolor=c, label=s, edgecolor="white")
             for s, c in _STATUS_COLOR.items()
             if any(col == c for col in colors)
         ]
-        if legend_handles:
-            ax.legend(handles=legend_handles, fontsize=7,
-                      loc="upper left", framealpha=0.8)
+        all_handles = status_handles + thresh_handles
+        if all_handles:
+            ax.legend(handles=all_handles, fontsize=7.5, loc="upper right",
+                      ncol=min(len(all_handles), 3))
 
         panel._draw()
 
@@ -407,12 +473,11 @@ class AnalysisTab(QWidget):
         ax = panel.ax
 
         plotted = 0
+        lines_drawn = []  # (line, label)
         for i, d in enumerate(data):
-            # 단계 순서에 따라 total_amount 정렬
             step_vals: Dict[str, float] = {}
             for m in d["metrics"]:
                 if m["total_amount"] is not None and m["step"] in _ALL_STEPS:
-                    # 같은 step에 여러 기록이 있으면 마지막 Qubit 우선
                     if m["step"] not in step_vals or m["instrument"] == "Qubit":
                         step_vals[m["step"]] = m["total_amount"]
 
@@ -420,46 +485,66 @@ class AnalysisTab(QWidget):
             if len(ordered_steps) < 2:
                 continue
 
-            x_labels = ordered_steps
             if show_pct:
                 first_val = step_vals[ordered_steps[0]]
                 if first_val == 0:
                     continue
                 y_vals = [step_vals[s] / first_val * 100 for s in ordered_steps]
-                y_vals[0] = 100.0   # 첫 단계는 항상 100%
+                y_vals[0] = 100.0
             else:
                 y_vals = [step_vals[s] for s in ordered_steps]
 
-            x = np.arange(len(x_labels))
-            color = _STEP_COLORS[i % len(_STEP_COLORS)]
-            ax.plot(x, y_vals, marker="o", linewidth=1.8, markersize=5,
-                    color=color, label=d["sample_id"])
-            for xi, yi in zip(x, y_vals):
-                ax.annotate(f"{yi:.0f}", (xi, yi),
-                            textcoords="offset points", xytext=(0, 6),
-                            ha="center", fontsize=7, color=color)
+            x = np.arange(len(ordered_steps))
+            color = _SAMPLE_PALETTE[i % len(_SAMPLE_PALETTE)]
+            lw = 1.6 if len(data) <= 10 else 1.2
+            ms = 5 if len(data) <= 10 else 3.5
+            line, = ax.plot(x, y_vals, marker="o", linewidth=lw, markersize=ms,
+                            color=color, alpha=0.85, label=d["sample_id"])
+            lines_drawn.append((line, d["sample_id"]))
+
+            # 숫자 레이블: 10개 이하일 때만
+            if len(data) <= 10:
+                for xi, yi in zip(x, y_vals):
+                    ax.annotate(f"{yi:.0f}", (xi, yi),
+                                textcoords="offset points", xytext=(0, 7),
+                                ha="center", fontsize=7, color=color, fontweight="bold")
             plotted += 1
 
         if plotted == 0:
             panel._no_data("Total Amount 데이터 없음\n(Qubit 측정값 2단계 이상 필요)")
             return
 
-        # x축은 _ALL_STEPS 전체 기준
         all_steps_present = sorted(
             {s for d in data for m in d["metrics"] if m["step"] in _ALL_STEPS
              for s in [m["step"]]},
             key=lambda s: _ALL_STEPS.index(s)
         )
         ax.set_xticks(np.arange(len(all_steps_present)))
-        ax.set_xticklabels(all_steps_present, rotation=18, ha="right", fontsize=8)
-        ax.set_ylabel("Recovery (%)" if show_pct else "Total Amount (ng)", fontsize=8)
-        ax.set_title("단계별 " + ("Recovery (%)" if show_pct else "Total Amount (ng)"),
-                     fontsize=9, fontweight="bold")
-        ax.spines[["top", "right"]].set_visible(False)
-        ax.grid(axis="y", alpha=0.3)
+        ax.set_xticklabels(all_steps_present, rotation=20, ha="right", fontsize=8)
+        ax.set_ylabel("Recovery (%)" if show_pct else "Total Amount (ng)", fontsize=8.5)
+        ax.set_title("단계별  " + ("Recovery (%)" if show_pct else "Total Amount (ng)"),
+                     fontsize=10, fontweight="bold", color="#222222")
         if show_pct:
-            ax.axhline(100, color="#BDBDBD", linestyle="--", linewidth=0.8)
-        ax.legend(fontsize=7, loc="upper right", framealpha=0.8)
+            ax.axhline(100, color="#BDBDBD", linestyle="--", linewidth=0.9)
+
+        # ── 범례 전략: 샘플 수에 따라 자동 선택 ──────────────────────
+        n = len(lines_drawn)
+        if n <= 8:
+            # 차트 내부 우상단
+            ax.legend(fontsize=7.5, loc="upper right", ncol=1)
+        elif n <= 16:
+            # 차트 오른쪽 외부
+            panel.fig.subplots_adjust(right=0.72)
+            ax.legend(fontsize=6.5, loc="upper left",
+                      bbox_to_anchor=(1.01, 1.0), borderaxespad=0,
+                      ncol=1, handlelength=1.5)
+        else:
+            # 너무 많으면 범례 생략 → 제목에 n 표기
+            ax.set_title(
+                "단계별  " + ("Recovery (%)" if show_pct else "Total Amount (ng)")
+                + f"  (n={n})",
+                fontsize=10, fontweight="bold", color="#222222"
+            )
 
         panel._draw()
 
@@ -486,52 +571,56 @@ class AnalysisTab(QWidget):
             panel._no_data(f"'{label}' 데이터 없음")
             return
 
+        all_mets = [m for d_ in data for m in d_["metrics"] if m.get(metric) is not None]
         arr = np.array(values)
-        bins = min(max(int(len(arr) ** 0.5) + 2, 5), 30)
-
-        # 상태별 색상 분리
-        pass_vals    = [v for v, d in zip(values, [
-            m for d_ in data for m in d_["metrics"] if m.get(metric) is not None
-        ]) if d.get("status") == "Pass"]
-        warn_vals    = [v for v, d in zip(values, [
-            m for d_ in data for m in d_["metrics"] if m.get(metric) is not None
-        ]) if d.get("status") == "Warning"]
-        fail_vals    = [v for v, d in zip(values, [
-            m for d_ in data for m in d_["metrics"] if m.get(metric) is not None
-        ]) if d.get("status") == "Fail"]
-        nodata_vals  = [v for v, d in zip(values, [
-            m for d_ in data for m in d_["metrics"] if m.get(metric) is not None
-        ]) if d.get("status") not in ("Pass", "Warning", "Fail")]
-
+        bins = min(max(int(len(arr) ** 0.5) + 3, 6), 25)
         rng = (arr.min(), arr.max())
+        if rng[0] == rng[1]:
+            rng = (rng[0] - 0.5, rng[1] + 0.5)
         bin_edges = np.linspace(rng[0], rng[1], bins + 1)
 
-        for vals, color, label_s in [
-            (pass_vals,   _STATUS_COLOR["Pass"],    "Pass"),
-            (warn_vals,   _STATUS_COLOR["Warning"], "Warning"),
-            (fail_vals,   _STATUS_COLOR["Fail"],    "Fail"),
-            (nodata_vals, _STATUS_COLOR["No Data"], "No Status"),
-        ]:
-            if vals:
-                ax.hist(vals, bins=bin_edges, color=color, alpha=0.75,
-                        edgecolor="white", linewidth=0.5, label=label_s)
+        # 상태별 분리
+        groups = {"Pass": [], "Warning": [], "Fail": [], "No Status": []}
+        for v, m in zip(values, all_mets):
+            s = m.get("status") or "No Status"
+            groups.get(s, groups["No Status"]).append(v)
+
+        color_map = {
+            "Pass":      (_STATUS_COLOR["Pass"],    0.80),
+            "Warning":   (_STATUS_COLOR["Warning"], 0.80),
+            "Fail":      (_STATUS_COLOR["Fail"],    0.80),
+            "No Status": (_STATUS_COLOR["No Data"], 0.55),
+        }
+        for s, (color, alpha) in color_map.items():
+            if groups[s]:
+                ax.hist(groups[s], bins=bin_edges, color=color, alpha=alpha,
+                        edgecolor="white", linewidth=0.6, label=f"{s} (n={len(groups[s])})",
+                        zorder=3)
 
         # QC 기준선
+        from matplotlib.lines import Line2D
+        thresh_handles = []
         for thresh_val, thresh_label, thresh_color in self._get_thresholds(metric):
             ax.axvline(thresh_val, color=thresh_color, linestyle="--",
-                       linewidth=1.5, alpha=0.9,
-                       label=f"{thresh_label} threshold ({thresh_val})")
+                       linewidth=1.8, alpha=0.95, zorder=4)
+            thresh_handles.append(Line2D([0], [0], color=thresh_color, linestyle="--",
+                                         linewidth=1.5, label=f"{thresh_label} ≥{thresh_val}"))
 
-        # 통계 표시
-        ax.axvline(arr.mean(), color="#333333", linestyle=":",
-                   linewidth=1.2, label=f"Mean ({arr.mean():.2f})")
+        # 평균선
+        mean_line = Line2D([0], [0], color="#555555", linestyle=":",
+                           linewidth=1.5, label=f"Mean {arr.mean():.2f}")
+        ax.axvline(arr.mean(), color="#555555", linestyle=":", linewidth=1.5, zorder=4)
 
-        ax.set_xlabel(label, fontsize=8)
-        ax.set_ylabel("Count", fontsize=8)
-        ax.set_title(f"{label} 분포  (n={len(arr)})", fontsize=9, fontweight="bold")
-        ax.tick_params(labelsize=8)
-        ax.spines[["top", "right"]].set_visible(False)
-        ax.legend(fontsize=7, framealpha=0.8)
+        ax.set_xlabel(label, fontsize=8.5, labelpad=4)
+        ax.set_ylabel("Count", fontsize=8.5, labelpad=4)
+        ax.set_title(f"{label}  분포  (n={len(arr)})", fontsize=10,
+                     fontweight="bold", color="#222222")
+        ax.yaxis.set_major_locator(mticker.MaxNLocator(integer=True))
+
+        handles, legends = ax.get_legend_handles_labels()
+        ax.legend(handles + thresh_handles + [mean_line],
+                  legends + [h.get_label() for h in thresh_handles + [mean_line]],
+                  fontsize=7.5, framealpha=0.9, ncol=2)
 
         panel._draw()
 
@@ -580,7 +669,7 @@ class AnalysisTab(QWidget):
             return
 
         x = np.arange(len(active_steps))
-        width = 0.55
+        width = min(0.55, 4.5 / max(len(active_steps), 1))
 
         status_order = [
             ("Pass",      _STATUS_COLOR["Pass"]),
@@ -595,32 +684,33 @@ class AnalysisTab(QWidget):
             if counts.sum() == 0:
                 continue
             bars = ax.bar(x, counts, width, bottom=bottoms,
-                          color=color, edgecolor="white", linewidth=0.6,
-                          label=status_key)
-            # 값 레이블 (0이 아닌 경우만)
+                          color=color, edgecolor="white", linewidth=0.8,
+                          label=status_key, zorder=3)
             for bar, cnt, bot in zip(bars, counts, bottoms):
                 if cnt > 0:
                     ax.text(bar.get_x() + bar.get_width() / 2,
-                            bot + cnt / 2,
-                            str(int(cnt)),
+                            bot + cnt / 2, str(int(cnt)),
                             ha="center", va="center",
-                            fontsize=9, fontweight="bold", color="white")
+                            fontsize=9, fontweight="bold", color="white",
+                            zorder=4)
             bottoms += counts
 
-        # 전체 합계 레이블 (바 위)
         totals = np.array([sum(step_counts[s].values()) for s in active_steps])
         for xi, tot in zip(x, totals):
             if tot > 0:
-                ax.text(xi, tot + 0.05, f"n={int(tot)}",
-                        ha="center", va="bottom", fontsize=8, color="#333333")
+                ax.text(xi, tot + max(totals) * 0.02, f"n={int(tot)}",
+                        ha="center", va="bottom", fontsize=8, color="#444444",
+                        fontweight="bold")
 
         ax.set_xticks(x)
-        ax.set_xticklabels(active_steps, rotation=18, ha="right", fontsize=8)
-        ax.set_ylabel("샘플 수", fontsize=8)
-        ax.set_ylim(0, max(totals) * 1.25)
-        ax.set_title("단계별 QC 상태 분포", fontsize=9, fontweight="bold")
-        ax.spines[["top", "right"]].set_visible(False)
-        ax.legend(fontsize=7, loc="upper right", framealpha=0.8)
+        ax.set_xticklabels(active_steps, rotation=22, ha="right", fontsize=8)
+        ax.set_ylabel("샘플 수", fontsize=8.5, labelpad=4)
+        ax.set_ylim(0, max(totals) * 1.28)
+        ax.yaxis.set_major_locator(mticker.MaxNLocator(integer=True))
+        ax.set_title("단계별 QC 상태 분포", fontsize=10, fontweight="bold",
+                     color="#222222")
+        ax.legend(fontsize=8, loc="upper right", framealpha=0.9,
+                  ncol=min(4, len(status_order)))
 
         panel._draw()
 

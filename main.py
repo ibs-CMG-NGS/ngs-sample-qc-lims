@@ -9,6 +9,7 @@ from PyQt5.QtCore import Qt
 
 from config.settings import LOG_LEVEL, LOG_FORMAT, LOG_FILE
 from ui.main_window import MainWindow
+from ui.app_icon import make_app_icon
 
 
 def setup_logging():
@@ -43,6 +44,7 @@ def main():
         app = QApplication(sys.argv)
         app.setApplicationName("NGS Sample QC LIMS")
         app.setOrganizationName("NGS Lab")
+        app.setWindowIcon(make_app_icon())
         
         # High DPI 지원 (PyQt5)
         app.setAttribute(Qt.AA_EnableHighDpiScaling, True)

@@ -5,6 +5,7 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QFrame, QScrollArea, QSizePolicy,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
+    QSplitter,
 )
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont, QColor
@@ -21,7 +22,7 @@ except ImportError:
     HAS_MPL = False
 
 from config.settings import STATUS_COLORS, SAMPLE_TYPES
-from database import db_manager, get_all_samples, get_latest_qc_metric
+from database import db_manager, get_all_samples, get_latest_qc_metric, get_all_projects
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,7 @@ CARD_COLORS = {
 }
 
 RECENT_COLS = ["Sample ID", "Name", "Type", "Latest Step", "Status", "Registered"]
+PROJECT_COLS = ["Project", "Species", "Material", "Total", "Pass", "Warning", "Fail", "No Data"]
 
 
 class _KpiCard(QFrame):
@@ -170,7 +172,33 @@ class DashboardTab(QWidget):
         self._recent_table.setAlternatingRowColors(True)
         recent_layout.addWidget(self._recent_table)
 
-        root.addWidget(recent_frame, 1)
+        # ── Project Overview 테이블 ───────────────────────────────────
+        proj_frame = QFrame()
+        proj_frame.setFrameShape(QFrame.StyledPanel)
+        proj_layout = QVBoxLayout(proj_frame)
+        proj_layout.setContentsMargins(8, 8, 8, 8)
+
+        proj_title = QLabel("Project Overview")
+        proj_title.setFont(font2)
+        proj_layout.addWidget(proj_title)
+
+        self._project_table = QTableWidget()
+        self._project_table.setColumnCount(len(PROJECT_COLS))
+        self._project_table.setHorizontalHeaderLabels(PROJECT_COLS)
+        self._project_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._project_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._project_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self._project_table.horizontalHeader().setStretchLastSection(True)
+        self._project_table.setAlternatingRowColors(True)
+        proj_layout.addWidget(self._project_table)
+
+        # ── Recent + Project 가로 배치 (스플리터) ─────────────────────
+        self._bottom_splitter = QSplitter(Qt.Horizontal)
+        self._bottom_splitter.addWidget(recent_frame)
+        self._bottom_splitter.addWidget(proj_frame)
+        self._bottom_splitter.setStretchFactor(0, 1)
+        self._bottom_splitter.setStretchFactor(1, 2)
+        root.addWidget(self._bottom_splitter, 1)
 
     @staticmethod
     def _wrap_chart(canvas, title_text: str) -> QFrame:
@@ -198,6 +226,8 @@ class DashboardTab(QWidget):
                 status_counts = {"Pass": 0, "Warning": 0, "Fail": 0, "No Data": 0}
                 type_counts: dict[str, int] = {}
                 recent_rows = []
+                project_stats: dict[str, dict] = {}
+                proj_meta = {p.project_name: p for p in get_all_projects(session)}
 
                 for s in samples:
                     # Sample type 집계
@@ -205,10 +235,24 @@ class DashboardTab(QWidget):
 
                     # 최신 QC status 집계
                     latest = get_latest_qc_metric(session, s.sample_id)
-                    if latest and latest.status in status_counts:
-                        status_counts[latest.status] += 1
-                    else:
-                        status_counts["No Data"] += 1
+                    status_key = (
+                        latest.status
+                        if latest and latest.status in status_counts
+                        else "No Data"
+                    )
+                    status_counts[status_key] += 1
+
+                    # Project별 집계
+                    pname = s.project or "(No Project)"
+                    if pname not in project_stats:
+                        pm = proj_meta.get(pname)
+                        project_stats[pname] = {
+                            "total": 0, "Pass": 0, "Warning": 0, "Fail": 0, "No Data": 0,
+                            "species":  (pm.species  or "") if pm else "",
+                            "material": (pm.material or "") if pm else "",
+                        }
+                    project_stats[pname]["total"] += 1
+                    project_stats[pname][status_key] += 1
 
                     recent_rows.append((
                         s.sample_id,
@@ -238,6 +282,36 @@ class DashboardTab(QWidget):
 
         # 최근 샘플 테이블 업데이트
         self._fill_recent_table(recent_rows)
+
+        # Project Overview 테이블 업데이트
+        self._fill_project_table(project_stats)
+
+    def _fill_project_table(self, stats: dict):
+        rows = sorted(stats.items(), key=lambda x: x[0])
+        self._project_table.setRowCount(len(rows))
+
+        col_map = {
+            "Pass":    (4, STATUS_COLORS["Pass"]),
+            "Warning": (5, STATUS_COLORS["Warning"]),
+            "Fail":    (6, STATUS_COLORS["Fail"]),
+        }
+
+        for row_idx, (pname, d) in enumerate(rows):
+            self._project_table.setItem(row_idx, 0, QTableWidgetItem(pname))
+            self._project_table.setItem(row_idx, 1, QTableWidgetItem(d["species"]))
+            self._project_table.setItem(row_idx, 2, QTableWidgetItem(d["material"]))
+            self._project_table.setItem(row_idx, 3, QTableWidgetItem(str(d["total"])))
+
+            for key, (col, color_hex) in col_map.items():
+                item = QTableWidgetItem(str(d[key]))
+                if d[key] > 0:
+                    item.setForeground(QColor(color_hex))
+                    item.setFont(self._bold_font())
+                self._project_table.setItem(row_idx, col, item)
+
+            self._project_table.setItem(row_idx, 7, QTableWidgetItem(str(d["No Data"])))
+
+        self._project_table.resizeColumnsToContents()
 
     def _draw_status_chart(self, counts: dict):
         ax = self._status_ax
@@ -362,9 +436,13 @@ class DashboardTab(QWidget):
     # ── GUI 상태 저장/복원 ────────────────────────────────────────────
 
     def save_gui_state(self, settings):
-        from config.gui_state import save_table_widths
+        from config.gui_state import save_table_widths, save_splitter
         save_table_widths(settings, "DashboardTab/recentTableWidths", self._recent_table)
+        save_table_widths(settings, "DashboardTab/projectTableWidths", self._project_table)
+        save_splitter(settings, "DashboardTab/bottomSplitter", self._bottom_splitter)
 
     def restore_gui_state(self, settings):
-        from config.gui_state import restore_table_widths
+        from config.gui_state import restore_table_widths, restore_splitter
         restore_table_widths(settings, "DashboardTab/recentTableWidths", self._recent_table)
+        restore_table_widths(settings, "DashboardTab/projectTableWidths", self._project_table)
+        restore_splitter(settings, "DashboardTab/bottomSplitter", self._bottom_splitter)

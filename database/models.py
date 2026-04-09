@@ -49,6 +49,7 @@ class Sample(Base):
     qc_metrics = relationship("QCMetric", back_populates="sample", cascade="all, delete-orphan")
     raw_traces = relationship("RawTrace", back_populates="sample", cascade="all, delete-orphan")
     notes = relationship("SampleNote", back_populates="sample", cascade="all, delete-orphan")
+    sequencing_results = relationship("SequencingResult", back_populates="sample", cascade="all, delete-orphan")
     
     def __repr__(self):
         return f"<Sample(id={self.sample_id}, type={self.sample_type})>"
@@ -202,6 +203,38 @@ class Project(Base):
 
     def __repr__(self):
         return f"<Project(name={self.project_name})>"
+
+
+class SequencingResult(Base):
+    """PacBio Revio 시퀀싱 후 QC 결과 테이블"""
+    __tablename__ = 'sequencing_results'
+
+    id                  = Column(Integer, primary_key=True, autoincrement=True)
+    sample_id           = Column(String(100), ForeignKey('samples.sample_id'), nullable=False)
+    run_id              = Column(String(200))   # r84285_20260402_061807
+    smrt_cell           = Column(String(20))    # 1_A01
+    barcode_id          = Column(String(20))    # bc2044
+    measured_at         = Column(DateTime, default=datetime.now)
+    created_at          = Column(DateTime, default=datetime.now)
+
+    hifi_reads_m        = Column(Float)   # HiFi Reads (M)
+    hifi_yield_gb       = Column(Float)   # HiFi Yield (Gb)
+    coverage_x          = Column(Float)   # Est. Coverage (×)
+    read_length_mean_kb = Column(Float)   # Read Length mean (kb)
+    read_length_n50_kb  = Column(Float)   # Read Length N50 (kb)
+    read_quality_q      = Column(Float)   # Read Quality median (Q값)
+    q30_pct             = Column(Float)   # Q30+ Bases (%)
+    zmw_p1_pct          = Column(Float)   # P1 ZMW Productivity (%)
+    missing_adapter_pct = Column(Float)   # Missing Adapter (%)
+    mean_passes         = Column(Float)   # Mean Passes
+    control_reads       = Column(Integer) # Control Reads
+    control_rl_mean_kb  = Column(Float)   # Control RL mean (kb)
+    status              = Column(String(20))  # Pass / Warning / Fail
+
+    sample = relationship("Sample", back_populates="sequencing_results")
+
+    def __repr__(self):
+        return f"<SequencingResult(sample={self.sample_id}, run={self.run_id}, status={self.status})>"
 
 
 class SampleNote(Base):

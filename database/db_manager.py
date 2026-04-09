@@ -67,6 +67,30 @@ class DatabaseManager:
             "ALTER TABLE samples ADD COLUMN branch_type VARCHAR(50)",
             "ALTER TABLE femtopulse_runs ADD COLUMN measured_at DATETIME",
             "ALTER TABLE qc_metrics ADD COLUMN index_no VARCHAR(50)",
+            # sequencing_results 테이블은 Base.metadata.create_all()이 생성하므로
+            # 기존 DB에 누락된 경우를 대비해 CREATE TABLE IF NOT EXISTS로 처리
+            """CREATE TABLE IF NOT EXISTS sequencing_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sample_id VARCHAR(100) REFERENCES samples(sample_id),
+                run_id VARCHAR(200),
+                smrt_cell VARCHAR(20),
+                barcode_id VARCHAR(20),
+                measured_at DATETIME,
+                created_at DATETIME,
+                hifi_reads_m FLOAT,
+                hifi_yield_gb FLOAT,
+                coverage_x FLOAT,
+                read_length_mean_kb FLOAT,
+                read_length_n50_kb FLOAT,
+                read_quality_q FLOAT,
+                q30_pct FLOAT,
+                zmw_p1_pct FLOAT,
+                missing_adapter_pct FLOAT,
+                mean_passes FLOAT,
+                control_reads INTEGER,
+                control_rl_mean_kb FLOAT,
+                status VARCHAR(20)
+            )""",
         ]
         with self.engine.connect() as conn:
             for sql in migrations:
@@ -415,3 +439,38 @@ def get_re_extraction_count(session, sample_id: str) -> int:
     return (session.query(Sample)
             .filter(Sample.parent_sample_id == sample_id)
             .count())
+
+
+# ── Sequencing Results ────────────────────────────────────────────
+
+def add_sequencing_result(session, data: dict):
+    """SequencingResult 레코드 추가."""
+    from database.models import SequencingResult
+    rec = SequencingResult(**data)
+    session.add(rec)
+    session.flush()
+    return rec
+
+
+def get_sequencing_results_by_sample(session, sample_id: str):
+    """특정 샘플의 SequencingResult 목록 (측정일 오름차순)."""
+    from database.models import SequencingResult
+    return (session.query(SequencingResult)
+            .filter(SequencingResult.sample_id == sample_id)
+            .order_by(SequencingResult.measured_at)
+            .all())
+
+
+def delete_sequencing_result(session, result_id: int):
+    """SequencingResult 레코드 삭제."""
+    from database.models import SequencingResult
+    rec = session.query(SequencingResult).filter(SequencingResult.id == result_id).first()
+    if rec:
+        session.delete(rec)
+
+
+def get_all_sequencing_results(session):
+    """전체 SequencingResult 목록 (Dashboard/Analysis용)."""
+    from database.models import SequencingResult
+    return session.query(SequencingResult).order_by(SequencingResult.measured_at).all()
+

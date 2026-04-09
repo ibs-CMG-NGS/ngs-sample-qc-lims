@@ -19,5 +19,8 @@ matplotlib>=3.7      # 차트 + PDF 리포트 생성
 gspread>=6.0         # Google Sheets API 클라이언트
 google-auth>=2.0     # Service Account 인증
 
+# HTML 파싱 (Revio QC 리포트 파서)
+beautifulsoup4>=4.12
+
 # Date parsing (Pull 시 다양한 날짜 형식 허용)
 python-dateutil>=2.8
