@@ -22,7 +22,8 @@ except ImportError:
     HAS_MPL = False
 
 from config.settings import STATUS_COLORS, SAMPLE_TYPES
-from database import db_manager, get_all_samples, get_latest_qc_metric, get_all_projects
+from database import db_manager, get_all_samples, get_latest_qc_metric, get_all_projects, get_all_sequencing_results
+from database.models import QCMetric
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +37,49 @@ CARD_COLORS = {
 }
 
 RECENT_COLS = ["Sample ID", "Name", "Type", "Latest Step", "Status", "Registered"]
-PROJECT_COLS = ["Project", "Species", "Material", "Total", "Pass", "Warning", "Fail", "No Data"]
+PROJECT_COLS = [
+    "Project", "Species", "Material",
+    "Total", "Pass", "Warning", "Fail",
+    "Extraction", "Lib Prep", "Sequencing",
+]
+
+# ── 단계 진행 현황 헬퍼 ──────────────────────────────────────────────────
+_CONC_INST = {"Qubit", "NanoDrop"}
+
+_STAGE_STYLE = {
+    "done":     ("#E8F5E9", "#2E7D32", "✓"),   # bg, fg, icon
+    "progress": ("#FFF3E0", "#E65100", "⟳"),
+    "pending":  ("#F5F5F5", "#757575", "—"),
+}
+
+
+def _sample_stages(sample, metrics: list, parent_metrics: list = None) -> tuple:
+    """(extraction_done, libprep_done) 반환.
+
+    parent_metrics: Aliquot 샘플의 경우 부모 QCMetric 리스트를 전달하면
+                    Extraction 단계를 부모 데이터로 상속.
+    """
+    is_rna = (sample.sample_type == "mRNA-seq")
+    ext_steps = {"RNA Extraction", "mRNA Elution"} if is_rna else {"gDNA Extraction", "SRE"}
+    lib_step  = "Library Prep (RNA)" if is_rna else "Library Prep"
+
+    # Extraction: 자기 데이터 + 부모 데이터(Aliquot 상속) 합산 확인
+    ext_check = list(metrics) + (parent_metrics or [])
+    ext_conc  = any(m.step in ext_steps and m.instrument in _CONC_INST and m.concentration for m in ext_check)
+    ext_femto = any(m.step in ext_steps and m.instrument == "Femto Pulse" for m in ext_check)
+
+    # Library Prep: 자기 데이터만 (Aliquot도 자체 Library Prep 필요)
+    lib_conc  = any(m.step == lib_step and m.instrument in _CONC_INST and m.concentration for m in metrics)
+    lib_femto = any(m.step == lib_step and m.instrument == "Femto Pulse" for m in metrics)
+    return (ext_conc and ext_femto), (lib_conc and lib_femto)
+
+
+def _stage_cell_style(done: int, total: int) -> tuple:
+    if total == 0 or done == 0:
+        return _STAGE_STYLE["pending"]
+    if done >= total:
+        return _STAGE_STYLE["done"]
+    return _STAGE_STYLE["progress"]
 
 
 class _KpiCard(QFrame):
@@ -229,6 +272,21 @@ class DashboardTab(QWidget):
                 project_stats: dict[str, dict] = {}
                 proj_meta = {p.project_name: p for p in get_all_projects(session)}
 
+                # 단계 진행 집계용 배치 로드
+                all_metrics = session.query(QCMetric).all()
+                metrics_by_sid: dict[str, list] = {}
+                for m in all_metrics:
+                    metrics_by_sid.setdefault(m.sample_id, []).append(m)
+
+                seq_sample_ids = {r.sample_id for r in get_all_sequencing_results(session)}
+
+                # 어떤 branch 유형이든 자식이 있는 부모 → Gantt 분모에서 제외 (자식이 전진)
+                branched_parent_ids = {
+                    s.parent_sample_id
+                    for s in samples
+                    if s.parent_sample_id
+                }
+
                 for s in samples:
                     # Sample type 집계
                     type_counts[s.sample_type] = type_counts.get(s.sample_type, 0) + 1
@@ -250,9 +308,43 @@ class DashboardTab(QWidget):
                             "total": 0, "Pass": 0, "Warning": 0, "Fail": 0, "No Data": 0,
                             "species":  (pm.species  or "") if pm else "",
                             "material": (pm.material or "") if pm else "",
+                            "gantt_total": 0,   # Re-extraction 부모 제외한 유효 샘플 수
+                            "ext_done": 0, "lib_done": 0, "seq_done": 0,
                         }
                     project_stats[pname]["total"] += 1
                     project_stats[pname][status_key] += 1
+
+                    # Gantt: 자식(branch)이 있는 부모는 분모/분자 모두 제외 (자식이 대표)
+                    if s.sample_id in branched_parent_ids:
+                        recent_rows.append((
+                            s.sample_id,
+                            s.sample_name or "",
+                            s.sample_type or "",
+                            latest.step if latest else "-",
+                            latest.status if latest else "No Data",
+                            s.created_at.strftime("%Y-%m-%d") if s.created_at else "-",
+                        ))
+                        continue
+
+                    project_stats[pname]["gantt_total"] += 1
+
+                    # Aliquot 샘플 → 부모 Extraction 데이터 상속
+                    parent_metrics = (
+                        metrics_by_sid.get(s.parent_sample_id, [])
+                        if s.branch_type == "Aliquot" and s.parent_sample_id
+                        else []
+                    )
+
+                    # 단계 완료 집계
+                    ext_ok, lib_ok = _sample_stages(
+                        s, metrics_by_sid.get(s.sample_id, []), parent_metrics
+                    )
+                    if ext_ok:
+                        project_stats[pname]["ext_done"] += 1
+                    if lib_ok:
+                        project_stats[pname]["lib_done"] += 1
+                    if s.sample_id in seq_sample_ids:
+                        project_stats[pname]["seq_done"] += 1
 
                     recent_rows.append((
                         s.sample_id,
@@ -309,7 +401,16 @@ class DashboardTab(QWidget):
                     item.setFont(self._bold_font())
                 self._project_table.setItem(row_idx, col, item)
 
-            self._project_table.setItem(row_idx, 7, QTableWidgetItem(str(d["No Data"])))
+            # 단계별 진행 현황 셀 (cols 7, 8, 9) — Re-extraction 교체 부모 제외한 분모
+            total = d["gantt_total"]
+            for col_off, key in enumerate(["ext_done", "lib_done", "seq_done"]):
+                done = d[key]
+                bg, fg, icon = _stage_cell_style(done, total)
+                item = QTableWidgetItem(f"{icon} {done}/{total}")
+                item.setTextAlignment(Qt.AlignCenter)
+                item.setBackground(QColor(bg))
+                item.setForeground(QColor(fg))
+                self._project_table.setItem(row_idx, 7 + col_off, item)
 
         self._project_table.resizeColumnsToContents()
 

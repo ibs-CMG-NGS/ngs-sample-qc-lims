@@ -142,6 +142,10 @@ class MainWindow(QMainWindow):
         seq_import_action.triggered.connect(self._open_seq_import)
         tools_menu.addAction(seq_import_action)
 
+        migrate_action = QAction('&Migrate FemtoPulse Files to Local…', self)
+        migrate_action.triggered.connect(self._migrate_femtopulse_files)
+        tools_menu.addAction(migrate_action)
+
         tools_menu.addSeparator()
 
         # Google Sheets 서브메뉴
@@ -300,6 +304,117 @@ class MainWindow(QMainWindow):
             sample_tab = self.tabs.widget(1)
             if hasattr(sample_tab, '_selected_sample_id') and sample_tab._selected_sample_id:
                 sample_tab._load_seq_results(sample_tab._selected_sample_id)
+
+    def _migrate_femtopulse_files(self):
+        """기존 FemtoPulseRun 절대 경로 레코드를 로컬 복사 + 상대 경로로 소급 적용."""
+        import shutil
+        from pathlib import Path
+        from config.settings import FEMTOPULSE_IMAGES_DIR, DATA_DIR
+        from database.models import FemtoPulseRun, RawTrace, QCMetric
+
+        reply = QMessageBox.question(
+            self, "Migrate FemtoPulse Files",
+            "DB에 저장된 기존 FemtoPulse 파일을 data/femtopulse_images/ 로 복사하고\n"
+            "경로를 상대 경로로 업데이트합니다.\n\n"
+            "원본 파일이 현재 PC에 존재해야 복사 가능합니다.\n"
+            "계속할까요?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        # 파일 1개를 복사하고 상대경로 문자열 반환. 실패/없으면 원본 반환.
+        def _copy_file(abs_path: str, dest_dir: Path) -> tuple[str, str]:
+            """(new_path_str, status) — status: 'copied'|'exists'|'missing'"""
+            p = Path(abs_path)
+            if not p.is_file():
+                return abs_path, 'missing'
+            dest = dest_dir / p.name
+            if not dest.exists():
+                shutil.copy2(p, dest)
+                status = 'copied'
+            else:
+                status = 'exists'
+            return str(dest.relative_to(DATA_DIR)), status
+
+        FILE_COLS = [
+            'quality_table_path', 'peak_table_path',
+            'electropherogram_path', 'size_calibration_path', 'smear_analysis_path',
+        ]
+
+        n_copied = n_skipped = n_missing = 0
+
+        try:
+            with db_manager.session_scope() as session:
+                runs = session.query(FemtoPulseRun).all()
+                progress = QProgressDialog(
+                    "FemtoPulse 파일 마이그레이션 중…", "Cancel", 0, len(runs), self
+                )
+                progress.setWindowModality(Qt.WindowModal)
+                progress.setMinimumDuration(0)
+
+                for i, run in enumerate(runs):
+                    progress.setValue(i)
+                    if progress.wasCanceled():
+                        break
+
+                    # electropherogram_path로 이미 상대 경로인지 판단
+                    sample_path = run.electropherogram_path or run.quality_table_path or ""
+                    if sample_path and not Path(sample_path).is_absolute():
+                        n_skipped += 1
+                        continue
+
+                    # 대상 폴더: measured_at 타임스탬프 기준
+                    ts = run.measured_at or run.created_at
+                    ts_str = ts.strftime("%Y%m%d_%H%M%S") if ts else f"run_{run.id}"
+                    dest_dir = FEMTOPULSE_IMAGES_DIR / ts_str
+                    dest_dir.mkdir(parents=True, exist_ok=True)
+
+                    # run_folder 업데이트 (디렉터리)
+                    run.run_folder = str(dest_dir.relative_to(DATA_DIR))
+
+                    # 5개 파일 컬럼 처리
+                    old_new: dict[str, str] = {}   # old_abs -> new_rel
+                    for col in FILE_COLS:
+                        old_path = getattr(run, col)
+                        if not old_path:
+                            continue
+                        new_path, status = _copy_file(old_path, dest_dir)
+                        if status == 'copied':
+                            n_copied += 1
+                        elif status == 'missing':
+                            n_missing += 1
+                        old_new[old_path] = new_path
+                        setattr(run, col, new_path)
+
+                    # RawTrace.raw_file_path 업데이트 (electropherogram 경로 변경분)
+                    for old_p, new_p in old_new.items():
+                        if old_p == new_p:
+                            continue
+                        (session.query(RawTrace)
+                         .filter(RawTrace.raw_file_path == old_p)
+                         .update({'raw_file_path': new_p}, synchronize_session=False))
+                        # QCMetric.data_file 업데이트
+                        (session.query(QCMetric)
+                         .filter(QCMetric.data_file == old_p)
+                         .update({'data_file': new_p}, synchronize_session=False))
+
+                progress.setValue(len(runs))
+
+        except Exception as e:
+            logger.error(f"FemtoPulse migration failed: {e}")
+            QMessageBox.critical(self, "Migration Error", f"마이그레이션 중 오류 발생:\n{e}")
+            return
+
+        QMessageBox.information(
+            self, "Migration Complete",
+            f"마이그레이션 완료\n\n"
+            f"  복사됨:        {n_copied}개 파일\n"
+            f"  이미 완료:     {n_skipped}개 run (스킵)\n"
+            f"  파일 없음:     {n_missing}개 (원본 경로 유지)\n\n"
+            "이제 data/lims.db + data/femtopulse_images/ 를\n"
+            "복사하면 다른 PC에서도 그래프가 표시됩니다."
+        )
 
     def _rejudge_all_qc(self):
         """모든 QCMetric 레코드에 판정 로직 재실행."""

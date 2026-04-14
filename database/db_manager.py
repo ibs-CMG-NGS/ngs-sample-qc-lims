@@ -411,13 +411,20 @@ def add_project(session, data: dict):
 
 
 def update_project(session, project_name: str, data: dict):
-    """프로젝트 수정"""
+    """프로젝트 수정. data에 'project_name' 키가 있으면 이름도 변경하고 샘플 cascade."""
+    from database.models import Sample
     proj = get_project_by_name(session, project_name)
     if not proj:
         return None
+    new_name = data.get("project_name")
     for key, value in data.items():
         if hasattr(proj, key):
             setattr(proj, key, value)
+    # 이름이 바뀐 경우 샘플의 project 문자열도 일괄 업데이트
+    if new_name and new_name != project_name:
+        (session.query(Sample)
+         .filter(Sample.project == project_name)
+         .update({"project": new_name}, synchronize_session=False))
     session.flush()
     return proj
 

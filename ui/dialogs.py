@@ -2,7 +2,9 @@
 다이얼로그 모음 - SampleDialog, NanoDropDialog, QubitDialog, FemtoPulseDialog, NoteDialog
 """
 import os
+import shutil
 from datetime import date, datetime
+from pathlib import Path
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLineEdit, QComboBox, QLabel, QPushButton, QDialogButtonBox,
@@ -15,7 +17,7 @@ from PyQt5.QtCore import Qt, QDate
 from PyQt5.QtGui import QFont
 import logging
 
-from config.settings import SAMPLE_TYPES, QC_STEPS, RNA_QC_STEPS, SPECIES_LIST, MATERIAL_LIST
+from config.settings import SAMPLE_TYPES, QC_STEPS, RNA_QC_STEPS, SPECIES_LIST, MATERIAL_LIST, FEMTOPULSE_IMAGES_DIR, DATA_DIR
 from database.models import Sample
 from database import (
     db_manager, add_sample, get_sample_by_id, update_sample,
@@ -63,8 +65,6 @@ class ProjectDialog(QDialog):
 
         self.name_edit = QLineEdit()
         self.name_edit.setPlaceholderText("Required")
-        if self._edit_name:
-            self.name_edit.setReadOnly(True)
         form.addRow("Project Name:", self.name_edit)
 
         self.species_combo = QComboBox()
@@ -137,6 +137,14 @@ class ProjectDialog(QDialog):
         try:
             with db_manager.session_scope() as session:
                 if self._edit_name:
+                    # 이름 변경 시 중복 체크
+                    if name != self._edit_name and get_project_by_name(session, name):
+                        QMessageBox.warning(
+                            self, "Duplicate",
+                            f"Project '{name}' already exists.",
+                        )
+                        return
+                    data["project_name"] = name
                     update_project(session, self._edit_name, data)
                 else:
                     if get_project_by_name(session, name):
@@ -362,7 +370,7 @@ class SampleDialog(QDialog):
         dlg = ProjectDialog(parent=self, edit_name=name)
         if dlg.exec_() == QDialog.Accepted:
             self._load_projects()
-            self.project_combo.setCurrentText(name)
+            self.project_combo.setCurrentText(dlg.saved_name or name)
 
     def _on_project_changed(self, index: int):
         """프로젝트 선택 시 species/material/sample_type 자동 채움."""
@@ -1045,17 +1053,37 @@ class FemtoPulseDialog(QDialog):
             pass  # 체크 실패해도 임포트는 계속 허용
 
         try:
+            # ── 원본 파일을 data/femtopulse_images/<YYYYMMDD_HHMMSS>/ 에 복사 ──
+            # DB에는 DATA_DIR 기준 상대 경로를 저장 → 다른 PC로 이식해도 동작
+            run_local_dir = FEMTOPULSE_IMAGES_DIR / measured_at.strftime("%Y%m%d_%H%M%S")
+            run_local_dir.mkdir(parents=True, exist_ok=True)
+
+            local_file_map: dict[str, str | None] = {}
+            for key, abs_path in self._file_map.items():
+                if not abs_path:
+                    local_file_map[key] = None
+                    continue
+                dest = run_local_dir / Path(abs_path).name
+                try:
+                    if not dest.exists():
+                        shutil.copy2(abs_path, dest)
+                    # DATA_DIR 기준 상대 경로로 변환
+                    local_file_map[key] = str(dest.relative_to(DATA_DIR))
+                except Exception as e:
+                    logger.warning(f"Failed to copy FemtoPulse file {abs_path}: {e}")
+                    local_file_map[key] = abs_path  # fallback: 원본 절대 경로 유지
+
             with db_manager.session_scope() as session:
-                # 1. Create FemtoPulseRun record
+                # 1. Create FemtoPulseRun record (상대 경로 저장)
                 run = add_femtopulse_run(session, {
-                    'run_folder': self._folder_path,
+                    'run_folder': str(run_local_dir.relative_to(DATA_DIR)),
                     'step': step,
                     'measured_at': measured_at,
-                    'quality_table_path': self._file_map.get('quality_table'),
-                    'peak_table_path': self._file_map.get('peak_table'),
-                    'electropherogram_path': self._file_map.get('electropherogram'),
-                    'size_calibration_path': self._file_map.get('size_calibration'),
-                    'smear_analysis_path': self._file_map.get('smear_analysis'),
+                    'quality_table_path': local_file_map.get('quality_table'),
+                    'peak_table_path': local_file_map.get('peak_table'),
+                    'electropherogram_path': local_file_map.get('electropherogram'),
+                    'size_calibration_path': local_file_map.get('size_calibration'),
+                    'smear_analysis_path': local_file_map.get('smear_analysis'),
                 })
 
                 # Build file_sample_id -> db_sample_id mapping (only filled rows)
@@ -1126,15 +1154,16 @@ class FemtoPulseDialog(QDialog):
                         'avg_size': fp_qc_data['avg_size'],
                         'status': fp_qc_data['status'],
                         'instrument': 'Femto Pulse',
-                        'data_file': self._file_map.get('quality_table'),
+                        'data_file': local_file_map.get('quality_table'),
                         'measured_at': measured_at,
                     })
 
-                    if electro_path:
+                    local_electro = local_file_map.get('electropherogram')
+                    if local_electro:
                         add_raw_trace(session, {
                             'sample_id': db_sid,
                             'step': step,
-                            'raw_file_path': electro_path,
+                            'raw_file_path': local_electro,
                             'image_path': file_sid,  # 원본 파일 Sample ID (컬럼 매칭용)
                             'instrument_name': 'Femto Pulse',
                             'assay_type': 'Electropherogram',

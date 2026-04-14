@@ -9,11 +9,23 @@ from pathlib import Path
 from typing import List, Dict, Optional
 import logging
 
-from config.settings import STATUS_COLORS, CHART_DPI, CHART_FIGSIZE
+from config.settings import STATUS_COLORS, CHART_DPI, CHART_FIGSIZE, DATA_DIR
 from database import db_manager, get_qc_metrics_by_sample
 from database.models import RawTrace
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_fp_path(stored: str | None) -> Path | None:
+    """DB에 저장된 경로를 실제 파일 경로로 변환.
+
+    - 절대 경로(기존 레코드): 그대로 반환
+    - 상대 경로(새 레코드): DATA_DIR 기준으로 resolve
+    """
+    if not stored:
+        return None
+    p = Path(stored)
+    return p if p.is_absolute() else DATA_DIR / p
 
 
 class QCVisualizer:
@@ -367,10 +379,8 @@ def load_electropherogram_traces(sample_id: str) -> tuple:
             )
 
             for rt in raw_traces:
-                if not rt.raw_file_path:
-                    continue
-                from pathlib import Path
-                if not Path(rt.raw_file_path).exists():
+                electro_path = _resolve_fp_path(rt.raw_file_path)
+                if not electro_path or not electro_path.exists():
                     logger.warning(f"Electropherogram file not found: {rt.raw_file_path}")
                     continue
 
@@ -382,10 +392,10 @@ def load_electropherogram_traces(sample_id: str) -> tuple:
                         .first()
                     )
                     if fp_run and fp_run.size_calibration_path:
-                        cal_path = fp_run.size_calibration_path
-                        if Path(cal_path).exists():
+                        cal_path = _resolve_fp_path(fp_run.size_calibration_path)
+                        if cal_path and cal_path.exists():
                             try:
-                                cal_data = parse_size_calibration(cal_path)
+                                cal_data = parse_size_calibration(str(cal_path))
                                 calibration = [
                                     {'time_sec': r['time_sec'],
                                      'ladder_size_bp': r['ladder_size_bp']}
@@ -397,7 +407,7 @@ def load_electropherogram_traces(sample_id: str) -> tuple:
                                 logger.warning(f"Failed to parse size calibration: {e}")
 
                 try:
-                    data = parse_electropherogram(rt.raw_file_path)
+                    data = parse_electropherogram(str(electro_path))
                     time_sec = data['time_sec']
 
                     # image_path stores the original file sample ID (e.g. "SampB1")
