@@ -28,6 +28,7 @@ from database import (
 )
 from ui.dialogs import SampleDialog, NanoDropDialog, QubitDialog, FemtoPulseDialog, NoteDialog
 from ui.sequencing_result_dialog import SequencingResultDialog
+from ui.electropherogram_dialog import ElectropherogramDialog
 from analysis.visualizer import load_electropherogram_traces, qc_visualizer
 
 logger = logging.getLogger(__name__)
@@ -173,8 +174,8 @@ class SampleTab(QWidget):
         self.sample_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         hdr = self.sample_table.horizontalHeader()
         hdr.setSectionResizeMode(QHeaderView.Interactive)
-        hdr.setSectionResizeMode(_COL_DESCRIPTION, QHeaderView.Stretch)
         hdr.setStretchLastSection(False)
+        self.sample_table.setColumnWidth(_COL_DESCRIPTION, 300)
         self.sample_table.setSortingEnabled(True)
         self.sample_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.sample_table.customContextMenuRequested.connect(self._on_sample_context_menu)
@@ -907,28 +908,18 @@ class SampleTab(QWidget):
             )
             return
 
-        fig = qc_visualizer.plot_electropherogram_overlay(
+        fig, ax, lines_dict, cal_bps, cal_times = qc_visualizer.plot_electropherogram_overlay(
             sample_id, traces, calibration=calibration
         )
         if fig is None:
             return
 
-        # Create a dialog with embedded matplotlib canvas
-        dlg = QDialog(self)
-        dlg.setWindowTitle(f"Electropherogram - {sample_id}")
-        dlg.setMinimumSize(900, 600)
-
-        layout = QVBoxLayout(dlg)
-
-        canvas = FigureCanvas(fig)
-        toolbar = NavigationToolbar(canvas, dlg)
-        layout.addWidget(toolbar)
-        layout.addWidget(canvas)
-
-        close_btn = QPushButton("Close")
-        close_btn.clicked.connect(dlg.accept)
-        layout.addWidget(close_btn)
-
+        dlg = ElectropherogramDialog(
+            title=f"Electropherogram - {sample_id}",
+            fig=fig, ax=ax, lines_dict=lines_dict,
+            cal_bps=cal_bps, cal_times=cal_times,
+            parent=self,
+        )
         dlg.exec_()
 
     def _show_electropherogram_multi(self, sample_ids):
@@ -961,26 +952,18 @@ class SampleTab(QWidget):
             return
 
         title = f"Electropherogram Comparison  ({len(sample_ids)} samples)"
-        fig = qc_visualizer.plot_electropherogram_overlay(
+        fig, ax, lines_dict, cal_bps, cal_times = qc_visualizer.plot_electropherogram_overlay(
             title, all_traces, calibration=calibration
         )
         if fig is None:
             return
 
-        dlg = QDialog(self)
-        dlg.setWindowTitle(title)
-        dlg.setMinimumSize(1000, 620)
-
-        layout = QVBoxLayout(dlg)
-        canvas = FigureCanvas(fig)
-        toolbar = NavigationToolbar(canvas, dlg)
-        layout.addWidget(toolbar)
-        layout.addWidget(canvas)
-
-        close_btn = QPushButton("Close")
-        close_btn.clicked.connect(dlg.accept)
-        layout.addWidget(close_btn)
-
+        dlg = ElectropherogramDialog(
+            title=title,
+            fig=fig, ax=ax, lines_dict=lines_dict,
+            cal_bps=cal_bps, cal_times=cal_times,
+            parent=self,
+        )
         dlg.exec_()
 
     def _load_seq_results(self, sample_id: str):

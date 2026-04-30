@@ -232,7 +232,7 @@ class QCVisualizer:
         traces: List[Dict],
         calibration: Optional[List[Dict]] = None,
         save_path: Optional[str] = None,
-    ) -> Optional[plt.Figure]:
+    ):
         """Electropherogram step-overlay for a single sample.
 
         X-axis is migration time (seconds), following the raw Femto Pulse output.
@@ -248,11 +248,13 @@ class QCVisualizer:
             save_path:   Optional file path to save the figure.
 
         Returns:
-            matplotlib Figure or None
+            (fig, ax, lines_dict, cal_bps_arr, cal_times_arr) or
+            (None, None, {}, None, None) when no traces are available.
+            lines_dict maps each trace label to its Line2D object.
         """
         if not traces:
             logger.warning(f"No electropherogram traces for {sample_id}")
-            return None
+            return None, None, {}, None, None
 
         fig, ax = plt.subplots(figsize=self.figsize, dpi=self.dpi)
 
@@ -293,6 +295,7 @@ class QCVisualizer:
                                   slope * (np.asarray(x_bp_arr)[mask] - cal_bps_arr[-1]))
             return x_interp
 
+        lines_dict = {}  # label → Line2D, for interactive toggling in the dialog
         max_data_time = None  # 실제 플롯된 데이터의 최대 x (migration time)
         for i, trace in enumerate(traces):
             step = trace.get('step', f'Step {i + 1}')
@@ -304,7 +307,8 @@ class QCVisualizer:
                     x = _bp_to_time(np.asarray(x_bp, dtype=float))
                 else:
                     x = np.asarray(x_bp, dtype=float)
-                ax.plot(x, rfu, label=step, color=colors[i], linewidth=1.5)
+                line = ax.plot(x, rfu, label=step, color=colors[i], linewidth=1.5)[0]
+                lines_dict[step] = line
                 x_max = float(np.max(x))
                 if max_data_time is None or x_max > max_data_time:
                     max_data_time = x_max
@@ -348,7 +352,7 @@ class QCVisualizer:
             plt.savefig(save_path, dpi=self.dpi, bbox_inches='tight')
             logger.info(f"Electropherogram overlay saved: {save_path}")
 
-        return fig
+        return fig, ax, lines_dict, cal_bps_arr, cal_times_arr
 
 
 def load_electropherogram_traces(sample_id: str) -> tuple:
@@ -467,7 +471,11 @@ def create_batch_comparison(samples: List[Dict], metric: str = 'gqn_rin', save_p
 
 def create_electropherogram_overlay(sample_id: str, traces: List[Dict] = None,
                                     calibration: List[Dict] = None, save_path: str = None):
-    """Electropherogram overlay 생성 헬퍼 함수"""
+    """Electropherogram overlay 생성 헬퍼 함수.
+
+    Returns:
+        (fig, ax, lines_dict, cal_bps_arr, cal_times_arr)
+    """
     if traces is None:
         traces, calibration = load_electropherogram_traces(sample_id)
     return qc_visualizer.plot_electropherogram_overlay(

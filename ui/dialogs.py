@@ -502,7 +502,19 @@ class NanoDropDialog(QDialog):
         self.conc_spin.setRange(0, 99999)
         self.conc_spin.setDecimals(2)
         self.conc_spin.setSuffix(" ng/ul")
+        self.conc_spin.valueChanged.connect(self._update_total)
         form.addRow("Concentration:", self.conc_spin)
+
+        self.vol_spin = QDoubleSpinBox()
+        self.vol_spin.setRange(0, 99999)
+        self.vol_spin.setDecimals(1)
+        self.vol_spin.setSuffix(" ul")
+        self.vol_spin.valueChanged.connect(self._update_total)
+        form.addRow("Volume:", self.vol_spin)
+
+        self.total_label = QLabel("0.00 ng")
+        self.total_label.setStyleSheet("font-weight: bold;")
+        form.addRow("Total Amount:", self.total_label)
 
         self.r280_spin = QDoubleSpinBox()
         self.r280_spin.setRange(0, 9.99)
@@ -544,6 +556,8 @@ class NanoDropDialog(QDialog):
                     return
                 if m.concentration is not None:
                     self.conc_spin.setValue(m.concentration)
+                if m.volume is not None:
+                    self.vol_spin.setValue(m.volume)
                 if m.purity_260_280 is not None:
                     self.r280_spin.setValue(m.purity_260_280)
                 if m.purity_260_230 is not None:
@@ -561,15 +575,24 @@ class NanoDropDialog(QDialog):
         except Exception as e:
             logger.error(f"Failed to load metric: {e}")
 
+    def _update_total(self):
+        total = self.conc_spin.value() * self.vol_spin.value()
+        self.total_label.setText(f"{total:.2f} ng")
+
     def _on_accept(self):
         step = self.step_combo.currentText()
         r230 = self.r230_spin.value() if self.r230_spin.value() > 0 else None
         qd = self.date_edit.date()
         measured_at = datetime(qd.year(), qd.month(), qd.day())
 
+        volume = self.vol_spin.value() if self.vol_spin.value() > 0 else None
+        total = (self.conc_spin.value() * volume) if volume else None
+
         data = {
             "step": step,
             "concentration": self.conc_spin.value(),
+            "volume": volume,
+            "total_amount": total,
             "purity_260_280": self.r280_spin.value(),
             "purity_260_230": r230,
             "measured_at": measured_at,
@@ -879,7 +902,7 @@ class FemtoPulseDialog(QDialog):
         self.preview_table = QTableWidget()
         self.preview_table.setColumnCount(5)
         self.preview_table.setHorizontalHeaderLabels([
-            "Well", "File Sample", "DB Sample ID", "DQN/RQN", "Conc (ng/ul)",
+            "Well", "File Sample", "DB Sample ID", "DQN/RQN", "Conc (pg/ul → ng/ul)",
         ])
         self.preview_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         layout.addWidget(self.preview_table)
@@ -1137,8 +1160,10 @@ class FemtoPulseDialog(QDialog):
                             avg_size = sr_data.get('avg_size')
                             break
 
+                    conc_pg_ul = r.get('total_concentration')
+                    conc_ng_ul = conc_pg_ul / 1000.0 if conc_pg_ul is not None else None
                     fp_qc_data = {
-                        'concentration': r.get('total_concentration'),
+                        'concentration': conc_ng_ul,   # pg/ul → ng/ul
                         'gqn_rin': r.get('dqn'),
                         'avg_size': avg_size,
                         'step': step,

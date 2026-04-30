@@ -11,16 +11,24 @@ import logging
 from typing import Dict, List, Optional
 
 import numpy as np
-from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QFont
+from PyQt5.QtCore import Qt, QRect, QSize
+from PyQt5.QtGui import QColor, QFont, QPainter
 from PyQt5.QtWidgets import (
+    QAbstractItemView,
     QComboBox,
+    QFileDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QPushButton,
     QSizePolicy,
+    QStyle,
+    QStyleOptionHeader,
+    QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -70,6 +78,9 @@ except ImportError:
 from config.settings import QC_STEPS, RNA_QC_STEPS, QC_CRITERIA, STATUS_COLORS
 
 _ALL_STEPS = QC_STEPS + RNA_QC_STEPS
+
+# mRNA-seq 는 RNA workflow, 나머지는 모두 DNA workflow
+_RNA_SAMPLE_TYPES = {"mRNA-seq"}
 from database import db_manager, get_all_samples, get_qc_metrics_by_sample
 
 logger = logging.getLogger(__name__)
@@ -110,6 +121,148 @@ _THRESHOLDS: Dict[str, List[tuple]] = {
 
 def _fmt(val, d=2) -> str:
     return f"{val:.{d}f}" if val is not None else "-"
+
+
+class _SortableItem(QTableWidgetItem):
+    """숫자 컬럼을 숫자 순서로 정렬하는 QTableWidgetItem."""
+    def __lt__(self, other):
+        try:
+            return float(self.text()) < float(other.text())
+        except (ValueError, TypeError):
+            return super().__lt__(other)
+
+
+# ── QC Summary 표 컬럼 정의 ──────────────────────────────────────────
+# (group_name, col_display, step_name_or_None, field_name)
+_STEP_COL_SPEC = [
+    ("Sample Info",        "Sample ID",    None,                  "sample_id"),
+    ("Sample Info",        "Name",         None,                  "sample_name"),
+    ("Sample Info",        "Project",      None,                  "project"),
+    ("gDNA Extraction",    "Conc.(ng/µl)", "gDNA Extraction",     "concentration"),
+    ("gDNA Extraction",    "Total(ng)",    "gDNA Extraction",     "total_amount"),
+    ("gDNA Extraction",    "260/280",      "gDNA Extraction",     "purity_260_280"),
+    ("gDNA Extraction",    "GQN",          "gDNA Extraction",     "gqn_rin"),
+    ("gDNA Extraction",    "Status",       "gDNA Extraction",     "status"),
+    ("SRE",                "Conc.(ng/µl)", "SRE",                 "concentration"),
+    ("SRE",                "Total(ng)",    "SRE",                 "total_amount"),
+    ("SRE",                "Status",       "SRE",                 "status"),
+    ("DNA Shearing",       "Conc.(ng/µl)", "DNA Shearing",        "concentration"),
+    ("DNA Shearing",       "Total(ng)",    "DNA Shearing",        "total_amount"),
+    ("DNA Shearing",       "AvgSize(bp)",  "DNA Shearing",        "avg_size"),
+    ("DNA Shearing",       "Status",       "DNA Shearing",        "status"),
+    ("Library Prep",       "Conc.(ng/µl)", "Library Prep",        "concentration"),
+    ("Library Prep",       "Total(ng)",    "Library Prep",        "total_amount"),
+    ("Library Prep",       "Index",        "Library Prep",        "index_no"),
+    ("Library Prep",       "Status",       "Library Prep",        "status"),
+    ("Polymerase Binding", "Conc.(ng/µl)", "Polymerase Binding",  "concentration"),
+    ("Polymerase Binding", "Total(ng)",    "Polymerase Binding",  "total_amount"),
+    ("Polymerase Binding", "Status",       "Polymerase Binding",  "status"),
+    ("RNA Extraction",     "Conc.(ng/µl)", "RNA Extraction",      "concentration"),
+    ("RNA Extraction",     "Total(ng)",    "RNA Extraction",      "total_amount"),
+    ("RNA Extraction",     "260/280",      "RNA Extraction",      "purity_260_280"),
+    ("RNA Extraction",     "RIN",          "RNA Extraction",      "gqn_rin"),
+    ("RNA Extraction",     "Status",       "RNA Extraction",      "status"),
+    ("mRNA Elution",       "Conc.(ng/µl)", "mRNA Elution",        "concentration"),
+    ("mRNA Elution",       "Total(ng)",    "mRNA Elution",        "total_amount"),
+    ("mRNA Elution",       "Status",       "mRNA Elution",        "status"),
+    ("Library Prep (RNA)", "Conc.(ng/µl)", "Library Prep (RNA)",  "concentration"),
+    ("Library Prep (RNA)", "Total(ng)",    "Library Prep (RNA)",  "total_amount"),
+    ("Library Prep (RNA)", "Status",       "Library Prep (RNA)",  "status"),
+]
+
+
+def _build_groups(col_defs):
+    """col_defs → [(group_label, start_col, col_count), ...]"""
+    groups, cur_group, cur_start = [], None, 0
+    for i, (group, *_) in enumerate(col_defs):
+        if group != cur_group:
+            if cur_group is not None:
+                groups.append((cur_group, cur_start, i - cur_start))
+            cur_group, cur_start = group, i
+    if cur_group is not None:
+        groups.append((cur_group, cur_start, len(col_defs) - cur_start))
+    return groups
+
+
+# ── 2단 병합 헤더 ────────────────────────────────────────────────────
+
+class _MultiHeaderView(QHeaderView):
+    """위쪽 절반: 그룹명(병합), 아래쪽 절반: 개별 컬럼명."""
+
+    _GROUP_BG   = QColor("#CFD8DC")   # 그룹 헤더 배경
+    _GROUP_FG   = QColor("#1A237E")   # 그룹 헤더 텍스트
+    _GROUP_BORDER = QColor("#90A4AE")
+
+    def __init__(self, col_labels, groups, parent=None):
+        super().__init__(Qt.Horizontal, parent)
+        self._col_labels = col_labels
+        self._groups = groups   # [(label, start, span), ...]
+        self.setSectionsClickable(True)
+
+    def sizeHint(self):
+        sh = super().sizeHint()
+        return QSize(sh.width(), sh.height() * 2)
+
+    def paintSection(self, painter, rect, logical_index):
+        if not rect.isValid():
+            return
+        painter.save()
+        half = rect.height() // 2
+
+        # 전체 배경 먼저 (기본 헤더 스타일)
+        opt = QStyleOptionHeader()
+        self.initStyleOption(opt)
+        opt.rect = rect
+        opt.section = logical_index
+        opt.text = ""
+        self.style().drawControl(QStyle.CE_Header, opt, painter, self)
+
+        # 아래 절반: 컬럼명
+        bot = QRect(rect.left(), rect.top() + half, rect.width(), half)
+        opt2 = QStyleOptionHeader()
+        self.initStyleOption(opt2)
+        opt2.rect = bot
+        opt2.section = logical_index
+        opt2.text = self._col_labels[logical_index]
+        opt2.textAlignment = Qt.AlignCenter
+        self.style().drawControl(QStyle.CE_Header, opt2, painter, self)
+
+        painter.restore()
+
+    def mousePressEvent(self, event):
+        # 위 절반(그룹 헤더) 클릭 시 정렬 트리거 방지
+        if event.y() < self.height() // 2:
+            return  # 이벤트 소비(accept), 부모로 버블링하지 않음
+        super().mousePressEvent(event)
+
+    def paintEvent(self, event):
+        # 먼저 개별 섹션(아래 절반) 페인트
+        super().paintEvent(event)
+
+        # 그 위에 그룹 헤더(위 절반) 오버레이
+        p = QPainter(self.viewport())
+        p.save()
+        half = self.height() // 2
+
+        for group_label, start, span in self._groups:
+            if start >= self.count():
+                continue
+            x0 = self.sectionViewportPosition(start)
+            total_w = sum(
+                self.sectionSize(i)
+                for i in range(start, min(start + span, self.count()))
+            )
+            rect = QRect(x0, 0, total_w, half)
+            p.fillRect(rect, self._GROUP_BG)
+            p.setPen(self._GROUP_BORDER)
+            p.drawRect(rect.adjusted(0, 0, -1, -1))
+            fnt = self.font()
+            fnt.setBold(True)
+            p.setFont(fnt)
+            p.setPen(self._GROUP_FG)
+            p.drawText(rect.adjusted(3, 0, -3, 0), Qt.AlignCenter, group_label)
+
+        p.restore()
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -271,7 +424,14 @@ class AnalysisTab(QWidget):
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
 
-        root.addLayout(grid, 1)
+        charts_widget = QWidget()
+        charts_widget.setLayout(grid)
+
+        self._tab_widget = QTabWidget()
+        self._tab_widget.addTab(charts_widget, "Charts")
+        self._tab_widget.addTab(self._build_table_tab(), "QC Table")
+
+        root.addWidget(self._tab_widget, 1)
 
     @staticmethod
     def _add_combo(panel: _ChartPanel, label: str, items: list) -> QComboBox:
@@ -281,6 +441,56 @@ class AnalysisTab(QWidget):
             cb.addItem(it)
         panel.ctrl_layout.addWidget(cb)
         return cb
+
+    def _build_table_tab(self) -> QWidget:
+        """QC Summary wide-form 표 탭 위젯 생성."""
+        w = QWidget()
+        vbox = QVBoxLayout(w)
+        vbox.setContentsMargins(6, 6, 6, 6)
+        vbox.setSpacing(4)
+
+        # 상단 버튼 행
+        top_row = QHBoxLayout()
+        top_row.addStretch()
+        export_btn = QPushButton("Export CSV")
+        export_btn.setMaximumWidth(100)
+        export_btn.clicked.connect(self._export_table_csv)
+        top_row.addWidget(export_btn)
+        vbox.addLayout(top_row)
+
+        col_labels = [c[1] for c in _STEP_COL_SPEC]
+        groups = _build_groups(_STEP_COL_SPEC)
+
+        self._summary_table = QTableWidget()
+        self._summary_table.setColumnCount(len(col_labels))
+
+        header = _MultiHeaderView(col_labels, groups, self._summary_table)
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setDefaultSectionSize(80)
+        header.setMinimumSectionSize(40)
+        self._summary_table.setHorizontalHeader(header)
+
+        self._summary_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._summary_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._summary_table.setAlternatingRowColors(True)
+        self._summary_table.setSortingEnabled(True)
+        header.setSortIndicatorShown(True)
+        self._summary_table.verticalHeader().setDefaultSectionSize(22)
+        self._summary_table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+
+        # 컬럼별 기본 폭 조정
+        for i, (group, col, step, field) in enumerate(_STEP_COL_SPEC):
+            if field in ("sample_id", "sample_name"):
+                self._summary_table.setColumnWidth(i, 110)
+            elif field == "status":
+                self._summary_table.setColumnWidth(i, 62)
+            elif field == "index_no":
+                self._summary_table.setColumnWidth(i, 75)
+            else:
+                self._summary_table.setColumnWidth(i, 72)
+
+        vbox.addWidget(self._summary_table)
+        return w
 
     # ── 데이터 로드 ──────────────────────────────────────────────────
 
@@ -306,6 +516,7 @@ class AnalysisTab(QWidget):
                                 "gqn_rin":        m.gqn_rin,
                                 "avg_size":       m.avg_size,
                                 "purity_260_280": m.purity_260_280,
+                                "index_no":       m.index_no,
                                 "status":         m.status,
                                 "measured_at":    m.measured_at,
                             }
@@ -341,6 +552,7 @@ class AnalysisTab(QWidget):
         self._proj_combo.blockSignals(False)
 
         self._draw_all()
+        self._refresh_table()
 
     def _get_thresholds(self, metric: str) -> List[tuple]:
         """현재 선택된 샘플 타입에 맞는 QC 기준선 반환."""
@@ -370,6 +582,149 @@ class AnalysisTab(QWidget):
 
     def _on_filter_changed(self):
         self._draw_all()
+        self._refresh_table()
+
+    # ── QC Summary 표 ────────────────────────────────────────────────
+
+    def _pivot_to_wide(self, data: List[dict]) -> List[dict]:
+        """샘플별 long-form metrics → step × field wide-form 행 리스트."""
+        rows = []
+        for s in data:
+            row: dict = {
+                "sample_id":   s["sample_id"],
+                "sample_name": s["sample_name"],
+                "project":     s["project"],
+            }
+            by_step: dict = {}
+            for m in s["metrics"]:
+                by_step.setdefault(m["step"], []).append(m)
+
+            for step in _ALL_STEPS:
+                mets = by_step.get(step, [])
+                qubit    = next((m for m in mets if m.get("instrument") == "Qubit"),    None)
+                nanodrop = next((m for m in mets if m.get("instrument") == "NanoDrop"), None)
+                primary  = qubit or nanodrop or (mets[0] if mets else None)
+                pfx = step + "__"
+                row[pfx + "concentration"]  = primary.get("concentration")  if primary  else None
+                row[pfx + "total_amount"]   = primary.get("total_amount")   if primary  else None
+                row[pfx + "purity_260_280"] = nanodrop.get("purity_260_280") if nanodrop else None
+                row[pfx + "avg_size"]       = primary.get("avg_size")       if primary  else None
+                row[pfx + "index_no"]       = primary.get("index_no")       if primary  else None
+
+                # gqn_rin: primary(Qubit/NanoDrop) 우선, 없으면 다른 기기(Femto Pulse) 탐색
+                # RNA Extraction의 RQN(=RIN)은 Femto Pulse 레코드의 gqn_rin에 저장됨
+                rin_val = primary.get("gqn_rin") if primary else None
+                if rin_val is None:
+                    for m in mets:
+                        if m.get("gqn_rin") is not None:
+                            rin_val = m["gqn_rin"]
+                            break
+                row[pfx + "gqn_rin"] = rin_val
+
+                # status: 해당 step의 모든 기기 판정 중 가장 나쁜 값 사용
+                _order = {"Pass": 0, "Warning": 1, "Fail": 2}
+                worst = None
+                for m in mets:
+                    s = m.get("status")
+                    if s in _order:
+                        if worst is None or _order[s] > _order[worst]:
+                            worst = s
+                row[pfx + "status"] = worst
+            rows.append(row)
+        return rows
+
+    def _apply_column_visibility(self):
+        """선택된 Sample Type에 따라 DNA/RNA 스텝 컬럼을 동적으로 숨기거나 표시한다."""
+        if not hasattr(self, "_summary_table"):
+            return
+        stype = self.type_combo.currentText()
+        is_rna = stype in _RNA_SAMPLE_TYPES
+        is_dna = stype != "All Types" and stype not in _RNA_SAMPLE_TYPES
+
+        rna_steps = set(RNA_QC_STEPS)
+        dna_steps = set(QC_STEPS)
+
+        for c, (group, col_label, step, field) in enumerate(_STEP_COL_SPEC):
+            if step is None:          # Sample Info — 항상 표시
+                hidden = False
+            elif step in rna_steps:   # RNA 전용 컬럼
+                hidden = is_dna
+            elif step in dna_steps:   # DNA 전용 컬럼
+                hidden = is_rna
+            else:
+                hidden = False
+            self._summary_table.setColumnHidden(c, hidden)
+
+    def _refresh_table(self):
+        """필터된 데이터로 QC Summary 표를 갱신한다."""
+        if not hasattr(self, "_summary_table"):
+            return
+        self._apply_column_visibility()
+        wide_rows = self._pivot_to_wide(self._filtered_data())
+        self._summary_table.setRowCount(len(wide_rows))
+
+        # Status 색상 (배경 반투명하게)
+        _status_bg = {
+            "Pass":    QColor(76, 175, 80, 60),
+            "Warning": QColor(255, 152, 0, 60),
+            "Fail":    QColor(244, 67, 54, 70),
+        }
+
+        _numeric_fields = {"concentration", "total_amount", "purity_260_280", "gqn_rin", "avg_size"}
+
+        self._summary_table.setSortingEnabled(False)
+        for r, row in enumerate(wide_rows):
+            for c, (group, col_label, step, field) in enumerate(_STEP_COL_SPEC):
+                key = (step + "__" + field) if step else field
+                val = row.get(key)
+
+                # 표시 텍스트
+                if val is None:
+                    text = ""
+                elif field in _numeric_fields:
+                    text = _fmt(val)
+                else:
+                    text = str(val)
+
+                item = _SortableItem(text) if field in _numeric_fields else QTableWidgetItem(text)
+                item.setTextAlignment(Qt.AlignCenter)
+
+                if field == "status" and val in _status_bg:
+                    item.setBackground(_status_bg[val])
+
+                self._summary_table.setItem(r, c, item)
+        self._summary_table.setSortingEnabled(True)
+
+    def _export_table_csv(self):
+        """현재 표시된 QC Summary 표를 CSV로 내보낸다."""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export QC Summary", "qc_summary.csv",
+            "CSV files (*.csv);;All files (*)"
+        )
+        if not path:
+            return
+
+        import csv
+        wide_rows = self._pivot_to_wide(self._filtered_data())
+
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                # 헤더 1행: 그룹명
+                writer.writerow([c[0] for c in _STEP_COL_SPEC])
+                # 헤더 2행: 컬럼명
+                writer.writerow([c[1] for c in _STEP_COL_SPEC])
+                # 데이터 행
+                for row in wide_rows:
+                    out = []
+                    for group, col_label, step, field in _STEP_COL_SPEC:
+                        key = (step + "__" + field) if step else field
+                        val = row.get(key)
+                        out.append("" if val is None else val)
+                    writer.writerow(out)
+            logger.info(f"QC summary exported: {path}")
+        except Exception as e:
+            logger.error(f"CSV export failed: {e}")
 
     def _draw_all(self):
         if not HAS_MPL:
@@ -739,3 +1094,7 @@ class AnalysisTab(QWidget):
             combo.blockSignals(True)
             restore_combo(settings, key, combo)
             combo.blockSignals(False)
+
+        # 복원된 필터를 차트·표에 즉시 적용
+        self._draw_all()
+        self._refresh_table()

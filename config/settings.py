@@ -71,6 +71,7 @@ QC_CRITERIA = {
             "pass": 8.0,
             "warning": 6.0
         },
+        # 참고용 — 판정에 사용하지 않음
         "purity_260_280": {
             "pass": 2.0,
             "warning": 1.8
@@ -79,9 +80,6 @@ QC_CRITERIA = {
             "pass": 1.8,
             "warning": 1.5
         },
-        "concentration": {
-            "warning": 5.0   # ng/µl 미만 → Warning
-        }
     }
 }
 
