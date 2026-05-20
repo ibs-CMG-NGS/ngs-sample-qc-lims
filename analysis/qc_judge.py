@@ -52,21 +52,65 @@ class QCJudge:
 
         return "Pass"
 
+    def _judge_by_mqi_cv(self, mqi, cv_total, criteria) -> str:
+        """Worst-of MQI and %CV for Femto Pulse smear-based RNA judgment."""
+        mqi_c = criteria.get('MQI', {'pass': 0.65, 'warning': 0.50})
+        cv_c  = criteria.get('CV',  {'pass': 70.0,  'warning': 85.0})
+        _order = {"Pass": 0, "Warning": 1, "Fail": 2}
+        result = "Pass"
+
+        if mqi is not None:
+            if mqi < mqi_c.get('warning', 0.50):
+                mqi_status = "Fail"
+            elif mqi < mqi_c.get('pass', 0.65):
+                mqi_status = "Warning"
+            else:
+                mqi_status = "Pass"
+            if _order[mqi_status] > _order[result]:
+                result = mqi_status
+
+        if cv_total is not None:
+            if cv_total > cv_c.get('warning', 85.0):
+                cv_status = "Fail"
+            elif cv_total > cv_c.get('pass', 70.0):
+                cv_status = "Warning"
+            else:
+                cv_status = "Pass"
+            if _order[cv_status] > _order[result]:
+                result = cv_status
+
+        return result
+
     def _judge_mrna(self, qc_data: Dict) -> str:
-        """mRNA-seq 샘플 판정 — RQN/RIN(Femto Pulse)만 판정에 사용
-        농도·260/280·260/230은 참고용이므로 판정에서 제외"""
+        """mRNA-seq 판정 규칙
+        - Femto Pulse (RIN 있음): RIN 기준 → Fail / Warning / Pass
+        - Femto Pulse smear (mqi/cv_total 있음): MQI + %CV 기준
+        - Qubit / NanoDrop (total_amount 있음): 총량 기준 → Warning(< 1 µg) / Pass
+        """
         criteria = self.criteria.get('mRNA-seq', {})
 
         rin = qc_data.get('gqn_rin')
-        if rin is None:
-            return "Pending"
+        if rin is not None:
+            rin_c = criteria.get('RIN', {})
+            if rin < rin_c.get('warning', 5.0):
+                return "Fail"
+            elif rin < rin_c.get('pass', 7.0):
+                return "Warning"
+            return "Pass"
 
-        rin_c = criteria.get('RIN', {})
-        if rin < rin_c.get('warning', 6.0):
-            return "Fail"
-        elif rin < rin_c.get('pass', 8.0):
-            return "Warning"
-        return "Pass"
+        # Femto Pulse smear-only (mRNA Elution): MQI + %CV
+        mqi = qc_data.get('mqi')
+        cv_total = qc_data.get('cv_total')
+        if mqi is not None or cv_total is not None:
+            return self._judge_by_mqi_cv(mqi, cv_total, criteria)
+
+        # RIN 없는 경우 (Qubit / NanoDrop): total_amount 기준
+        total = qc_data.get('total_amount')
+        if total is not None:
+            pass_thr = criteria.get('total_amount', {}).get('pass', 1000.0)
+            return "Pass" if total >= pass_thr else "Warning"
+
+        return "Pending"
     
     def _judge_generic(self, qc_data: Dict) -> str:
         """일반 샘플 판정 (농도 기준)"""
@@ -115,14 +159,25 @@ class QCJudge:
             p230 = qc_data.get('purity_260_230')
 
             if rin is not None:
-                rin_warn = criteria.get('RIN', {}).get('warning', 6.0)
-                rin_pass = criteria.get('RIN', {}).get('pass', 8.0)
+                rin_warn = criteria.get('RIN', {}).get('warning', 5.0)
+                rin_pass = criteria.get('RIN', {}).get('pass', 7.0)
                 if rin < rin_warn:
                     reasons.append(f"RIN too low: {rin:.1f} (< {rin_warn})")
                     suggestions.append("RNA is degraded. Not suitable for mRNA-seq.")
                 elif rin < rin_pass:
                     reasons.append(f"RIN suboptimal: {rin:.1f} (< {rin_pass})")
                     suggestions.append("Can proceed but expect reduced library complexity.")
+            else:
+                total = qc_data.get('total_amount')
+                if total is not None:
+                    pass_thr = criteria.get('total_amount', {}).get('pass', 1000.0)
+                    if total < pass_thr:
+                        reasons.append(
+                            f"Total RNA low: {total:.1f} ng (< {pass_thr:.0f} ng = 1 µg)"
+                        )
+                        suggestions.append(
+                            "Increase input RNA amount for sufficient library yield."
+                        )
 
             # 참고 정보 (판정에는 미사용)
             if p280 is not None:

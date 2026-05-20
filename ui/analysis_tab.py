@@ -22,6 +22,7 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QMessageBox,
     QPushButton,
     QSizePolicy,
     QStyle,
@@ -377,6 +378,19 @@ class AnalysisTab(QWidget):
 
         hdr.addStretch()
 
+        btn_rejudge = QPushButton("Re-judge All QC")
+        btn_rejudge.setToolTip(
+            "모든 QC 레코드를 현재 판정 기준으로 재판정합니다.\n"
+            "기준이 변경된 후 기존 데이터를 일괄 업데이트할 때 사용하세요."
+        )
+        btn_rejudge.setStyleSheet(
+            "QPushButton { background:#1A237E; color:white; padding:4px 10px; "
+            "border-radius:4px; font-weight:bold; }"
+            "QPushButton:hover { background:#283593; }"
+        )
+        btn_rejudge.clicked.connect(self._rejudge_all)
+        hdr.addWidget(btn_rejudge)
+
         btn_refresh = QPushButton("Refresh")
         btn_refresh.clicked.connect(self.refresh)
         hdr.addWidget(btn_refresh)
@@ -491,6 +505,44 @@ class AnalysisTab(QWidget):
 
         vbox.addWidget(self._summary_table)
         return w
+
+    # ── QC 재판정 ────────────────────────────────────────────────────
+
+    def _rejudge_all(self):
+        """모든 QCMetric을 현재 기준으로 재판정하고 DB를 업데이트한다."""
+        from database import rejudge_all_metrics
+
+        reply = QMessageBox.question(
+            self, "Re-judge All QC",
+            "모든 QC 레코드를 현재 판정 기준으로 재판정합니다.\n"
+            "기존 status가 변경될 수 있습니다. 계속하시겠습니까?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        try:
+            with db_manager.session_scope() as session:
+                result = rejudge_all_metrics(session)
+        except Exception as e:
+            QMessageBox.critical(self, "오류", f"재판정 중 오류 발생:\n{e}")
+            return
+
+        # 결과 요약 메시지
+        by_type = result["by_type"]
+        lines = [
+            f"총 {result['total']}건 중 {result['updated']}건 status 변경됨.\n"
+        ]
+        for stype, counts in sorted(by_type.items()):
+            summary = "  /  ".join(f"{k}: {v}" for k, v in sorted(counts.items()))
+            lines.append(f"  [{stype}]  {summary}")
+
+        QMessageBox.information(
+            self, "Re-judge 완료",
+            "\n".join(lines),
+        )
+        self.refresh()
 
     # ── 데이터 로드 ──────────────────────────────────────────────────
 
@@ -1000,17 +1052,24 @@ class AnalysisTab(QWidget):
             for step in _ALL_STEPS
         }
 
+        # Pending / 알 수 없는 status → "No Status"로 정규화
+        _priority = {"Fail": 0, "Warning": 1, "Pass": 2, "No Status": 3}
+
+        def _normalise(s):
+            if s in ("Pass", "Warning", "Fail"):
+                return s
+            return "No Status"
+
         for d in data:
             seen_steps: Dict[str, str] = {}  # step -> 대표 status
             for m in d["metrics"]:
                 step = m["step"]
                 if step not in step_counts:
                     continue
-                status = m["status"] or "No Status"
-                # 같은 step에 여러 기록: 가장 낮은 상태 우선 (Fail > Warning > Pass)
-                priority = {"Fail": 0, "Warning": 1, "Pass": 2, "No Status": 3}
+                status = _normalise(m["status"] or "")
+                # 같은 step에 여러 기록: 가장 나쁜 상태 우선 (Fail > Warning > Pass)
                 if step not in seen_steps or (
-                    priority.get(status, 3) < priority.get(seen_steps[step], 3)
+                    _priority.get(status, 3) < _priority.get(seen_steps[step], 3)
                 ):
                     seen_steps[step] = status
             for step, status in seen_steps.items():

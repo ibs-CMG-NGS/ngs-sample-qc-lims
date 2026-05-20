@@ -19,14 +19,15 @@ try:
 except ImportError:
     HAS_MPL_QT = False
 
-from config.settings import QC_STEPS, STATUS_COLORS
+from config.settings import QC_STEPS, RNA_QC_STEPS, STATUS_COLORS
 from database import (
     db_manager, get_all_samples, get_latest_qc_metric,
     get_qc_metrics_by_sample, delete_qc_metric, delete_sample,
     get_smear_analyses_by_sample,
     get_sequencing_results_by_sample, delete_sequencing_result,
+    rename_sample_id,
 )
-from ui.dialogs import SampleDialog, NanoDropDialog, QubitDialog, FemtoPulseDialog, NoteDialog
+from ui.dialogs import SampleDialog, NanoDropDialog, QubitDialog, FemtoPulseDialog, NoteDialog, BatchSampleDialog
 from ui.sequencing_result_dialog import SequencingResultDialog
 from ui.electropherogram_dialog import ElectropherogramDialog
 from analysis.visualizer import load_electropherogram_traces, qc_visualizer
@@ -52,16 +53,109 @@ SEQ_RESULT_COLS = [
 QC_COLS = [
     "Step", "Instrument", "Conc", "Vol", "Total",
     "Recovery", "260/280", "DQN/RQN", "AvgSize",
-    "1k-10k%", "10k-165k%",
+    "Low%", "High%",
+    "%CV", "MQI",
     "Status", "Date",
 ]
+# Column index constants
+_QC_COL_CV     = QC_COLS.index("%CV")
+_QC_COL_MQI    = QC_COLS.index("MQI")
+_QC_COL_STATUS = QC_COLS.index("Status")
+_QC_COL_DATE   = QC_COLS.index("Date")
 
 
-def _fmt(val):
+def _fmt(val, decimals: int = 2):
     """Format a numeric value for display."""
     if val is None:
         return "-"
-    return f"{val:.2f}"
+    return f"{val:.{decimals}f}"
+
+
+def _range_span(range_text: str) -> float:
+    """Return end - start from a range string like '200 nt to 6000 nt'."""
+    import re
+    nums = [float(n) for n in re.findall(r'\d+(?:\.\d+)?',
+                                          str(range_text).replace(',', ''))]
+    return (nums[1] - nums[0]) if len(nums) >= 2 else 0.0
+
+
+def _widest_avg_size(step_smears: dict):
+    """Return avg_size from the widest-span smear range (= Total range).
+
+    Used as a display fallback when QCMetric.avg_size is None but
+    SmearAnalysis records are present in the DB.
+    """
+    if not step_smears:
+        return None
+    widest_key = max(step_smears, key=_range_span)
+    sa = step_smears.get(widest_key)
+    return sa.avg_size if sa is not None else None
+
+
+def _widest_cv(step_smears: dict):
+    """Return %CV string from the widest-span smear range (= Total range)."""
+    if not step_smears:
+        return "-"
+    widest_key = max(step_smears, key=_range_span)
+    sa = step_smears.get(widest_key)
+    if sa is None or sa.cv is None:
+        return "-"
+    return f"{sa.cv:.1f}"
+
+
+def _smear_low_high(step_smears: dict):
+    """Parse RNA smear ranges into (pct_low, pct_high).
+
+    - Widest-span range = Total (200–6000 nt) → excluded (avoid double-count).
+    - Remaining ranges: midpoint < 1000 → low, midpoint >= 1000 → high.
+    Returns (pct_low, pct_high) floats, or (None, None) if no data.
+    """
+    import re
+
+    def _span(rt):
+        nums = [float(n) for n in re.findall(r'\d+(?:\.\d+)?',
+                                              str(rt).replace(',', ''))]
+        return (nums[1] - nums[0]) if len(nums) >= 2 else 0.0
+
+    if not step_smears:
+        return None, None
+
+    total_key = max(step_smears, key=_span)
+    pct_low = 0.0
+    pct_high = 0.0
+    has_data = False
+
+    for rng_text, sa in step_smears.items():
+        if rng_text == total_key:
+            continue
+        if sa.pct_total is None:
+            continue
+        text = str(rng_text).replace(',', '')
+        if re.search(r'marker|ladder', text, re.IGNORECASE):
+            continue
+        nums = [float(n) for n in re.findall(r'\d+(?:\.\d+)?', text)]
+        if not nums:
+            continue
+        start = nums[0]
+        end = nums[1] if len(nums) >= 2 else start * 5
+        mid = (start + end) / 2
+        has_data = True
+        if mid < 1000:
+            pct_low += sa.pct_total
+        else:
+            pct_high += sa.pct_total
+
+    return (pct_low, pct_high) if has_data else (None, None)
+
+
+def _compute_mqi(step_smears: dict) -> str:
+    """MQI = High% / (Low% + High%) — 0-1 scale, higher = more intact RNA."""
+    pct_low, pct_high = _smear_low_high(step_smears)
+    if pct_high is not None and pct_low is not None:
+        denom = pct_low + pct_high
+        if denom > 0:
+            return f"{pct_high / denom:.2f}"
+    return "-"
 
 
 class SampleTab(QWidget):
@@ -85,6 +179,11 @@ class SampleTab(QWidget):
         btn_new = QPushButton("New Sample")
         btn_new.clicked.connect(self.open_new_sample_dialog)
         btn_bar.addWidget(btn_new)
+
+        btn_batch = QPushButton("Batch Register")
+        btn_batch.setToolTip("여러 샘플을 한 번에 등록 (prefix + 번호 자동 생성)")
+        btn_batch.clicked.connect(self._open_batch_register)
+        btn_bar.addWidget(btn_batch)
 
         btn_edit = QPushButton("Edit Sample")
         btn_edit.clicked.connect(self._open_edit_sample)
@@ -161,7 +260,6 @@ class SampleTab(QWidget):
         filter_bar.addWidget(self.filter_branched_combo)
 
         btn_clear_filter = QPushButton("Clear")
-        btn_clear_filter.setFixedWidth(55)
         btn_clear_filter.clicked.connect(self._clear_filter)
         filter_bar.addWidget(btn_clear_filter)
         top_layout.addLayout(filter_bar)
@@ -172,6 +270,7 @@ class SampleTab(QWidget):
         self.sample_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.sample_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.sample_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.sample_table.setAlternatingRowColors(True)
         hdr = self.sample_table.horizontalHeader()
         hdr.setSectionResizeMode(QHeaderView.Interactive)
         hdr.setStretchLastSection(False)
@@ -208,6 +307,7 @@ class SampleTab(QWidget):
         self.qc_table.setHorizontalHeaderLabels(QC_COLS)
         self.qc_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.qc_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.qc_table.setAlternatingRowColors(True)
         self.qc_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.qc_table.horizontalHeader().setStretchLastSection(True)
         self.qc_table.doubleClicked.connect(self._on_qc_double_click)
@@ -230,6 +330,7 @@ class SampleTab(QWidget):
         self.seq_table.setHorizontalHeaderLabels(SEQ_RESULT_COLS)
         self.seq_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.seq_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.seq_table.setAlternatingRowColors(True)
         self.seq_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.seq_table.horizontalHeader().setStretchLastSection(True)
         self.seq_table.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -262,7 +363,15 @@ class SampleTab(QWidget):
 
         try:
             with db_manager.session_scope() as session:
-                samples = get_all_samples(session)
+                samples_raw = get_all_samples(session)
+                # get_all_samples은 created_at DESC 정렬 → 첫 등장이 최신; 중복 sample_id 제거
+                _seen: set = set()
+                samples = []
+                for s in samples_raw:
+                    if s.sample_id not in _seen:
+                        _seen.add(s.sample_id)
+                        samples.append(s)
+
                 self.sample_table.setRowCount(len(samples))
                 types_seen    = set()
                 projects_seen = set()
@@ -504,6 +613,10 @@ class SampleTab(QWidget):
         rejudge_action.triggered.connect(lambda: self._rejudge_sample(sample_id))
         menu.addAction(rejudge_action)
 
+        rename_action = QAction("Rename Sample ID…", self)
+        rename_action.triggered.connect(lambda: self._rename_sample_id(sample_id))
+        menu.addAction(rename_action)
+
         menu.addSeparator()
 
         del_action = QAction("Delete Sample", self)
@@ -511,6 +624,48 @@ class SampleTab(QWidget):
         menu.addAction(del_action)
 
         menu.exec_(self.sample_table.viewport().mapToGlobal(pos))
+
+    def _rename_sample_id(self, old_id: str):
+        """Sample ID 변경 — QInputDialog로 새 ID를 입력받고 DB 전체 업데이트."""
+        from PyQt5.QtWidgets import QInputDialog
+        new_id, ok = QInputDialog.getText(
+            self, "Rename Sample ID",
+            f"'{old_id}'의 새 Sample ID를 입력하세요:",
+            text=old_id,
+        )
+        if not ok:
+            return
+        new_id = new_id.strip()
+        if not new_id or new_id == old_id:
+            return
+
+        reply = QMessageBox.question(
+            self, "Confirm Rename",
+            f"Sample ID를 변경합니다.\n\n"
+            f"  Before: {old_id}\n"
+            f"  After:  {new_id}\n\n"
+            f"QC Metrics, Notes, Sequencing Results 등\n"
+            f"관련 데이터도 모두 새 ID로 업데이트됩니다.\n\n"
+            f"계속할까요?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        try:
+            with db_manager.session_scope() as session:
+                rename_sample_id(session, old_id, new_id)
+            QMessageBox.information(
+                self, "완료",
+                f"Sample ID가 변경되었습니다.\n{old_id}  →  {new_id}",
+            )
+            self.refresh_samples()
+        except ValueError as e:
+            QMessageBox.warning(self, "Rename 실패", str(e))
+        except Exception as e:
+            logger.error(f"Rename sample ID failed: {e}")
+            QMessageBox.critical(self, "Error", f"Rename 중 오류 발생:\n{e}")
 
     def _rejudge_sample(self, sample_id: str):
         """선택한 샘플의 모든 QCMetric에 대해 판정 재실행."""
@@ -620,6 +775,11 @@ class SampleTab(QWidget):
 
         try:
             with db_manager.session_scope() as session:
+                from database import get_sample_by_id
+                sample_obj = get_sample_by_id(session, sample_id)
+                sample_type = (sample_obj.sample_type or '') if sample_obj else ''
+                is_rna = 'rna' in sample_type.lower()
+
                 metrics = get_qc_metrics_by_sample(session, sample_id)
                 if not metrics:
                     return
@@ -659,22 +819,47 @@ class SampleTab(QWidget):
                     self.qc_table.setItem(
                         row, 7, QTableWidgetItem(_fmt(m.gqn_rin))
                     )
-                    self.qc_table.setItem(
-                        row, 8, QTableWidgetItem(_fmt(m.avg_size))
-                    )
-
-                    # Smear %Total columns (Femto Pulse only)
-                    pct_1k_10k = "-"
-                    pct_10k_165k = "-"
+                    # Low% / High% smear columns (Femto Pulse only)
+                    # DNA : 1k-10k% / 10k-165k%  (hardcoded range match)
+                    # RNA : 200-1000 nt / 1000-6000 nt (midpoint-based, total excluded)
+                    pct_low_str = "-"
+                    pct_high_str = "-"
                     step_smears = smear_by_step.get(m.step, {})
                     if m.instrument == 'Femto Pulse' and step_smears:
-                        for rng, sa in step_smears.items():
-                            if '1000' in rng and '10000' in rng and '165' not in rng:
-                                pct_1k_10k = _fmt(sa.pct_total)
-                            elif '10000' in rng and '165' in rng:
-                                pct_10k_165k = _fmt(sa.pct_total)
-                    self.qc_table.setItem(row, 9, QTableWidgetItem(pct_1k_10k))
-                    self.qc_table.setItem(row, 10, QTableWidgetItem(pct_10k_165k))
+                        if is_rna:
+                            lv, hv = _smear_low_high(step_smears)
+                            if lv is not None:
+                                pct_low_str = _fmt(lv)
+                            if hv is not None:
+                                pct_high_str = _fmt(hv)
+                        else:
+                            for rng, sa in step_smears.items():
+                                if '1000' in rng and '10000' in rng and '165' not in rng:
+                                    pct_low_str = _fmt(sa.pct_total)
+                                elif '10000' in rng and '165' in rng:
+                                    pct_high_str = _fmt(sa.pct_total)
+                    self.qc_table.setItem(row, 9, QTableWidgetItem(pct_low_str))
+                    self.qc_table.setItem(row, 10, QTableWidgetItem(pct_high_str))
+
+                    # AvgSize: QCMetric.avg_size 우선, 없으면 SmearAnalysis 최광폭 range 평균
+                    avg_size_val = m.avg_size
+                    if avg_size_val is None and m.instrument == 'Femto Pulse' and step_smears and is_rna:
+                        avg_size_val = _widest_avg_size(step_smears)
+                    self.qc_table.setItem(row, 8, QTableWidgetItem(_fmt(avg_size_val)))
+
+                    # %CV and MQI (Femto Pulse + RNA only)
+                    cv_str = (
+                        _widest_cv(step_smears)
+                        if m.instrument == 'Femto Pulse' and step_smears and is_rna
+                        else "-"
+                    )
+                    mqi_str = (
+                        _compute_mqi(step_smears)
+                        if m.instrument == 'Femto Pulse' and step_smears and is_rna
+                        else "-"
+                    )
+                    self.qc_table.setItem(row, _QC_COL_CV, QTableWidgetItem(cv_str))
+                    self.qc_table.setItem(row, _QC_COL_MQI, QTableWidgetItem(mqi_str))
 
                     status_text = m.status or "-"
                     status_item = QTableWidgetItem(status_text)
@@ -682,7 +867,7 @@ class SampleTab(QWidget):
                     if color:
                         from PyQt5.QtGui import QColor
                         status_item.setForeground(QColor(color))
-                    self.qc_table.setItem(row, 11, status_item)
+                    self.qc_table.setItem(row, _QC_COL_STATUS, status_item)
 
                     date_str = (
                         m.measured_at.strftime("%Y-%m-%d")
@@ -690,7 +875,7 @@ class SampleTab(QWidget):
                         else "-"
                     )
                     self.qc_table.setItem(
-                        row, 12, QTableWidgetItem(date_str)
+                        row, _QC_COL_DATE, QTableWidgetItem(date_str)
                     )
 
         except Exception as e:
@@ -698,23 +883,41 @@ class SampleTab(QWidget):
 
     @staticmethod
     def _calc_recovery(metrics):
-        """step별 recovery rate 계산 (CLI menu_status 로직 재사용)."""
-        prev_total_map = {}
+        """step별 recovery rate 계산. DNA/RNA 공통, Qubit > NanoDrop 우선순위."""
+        _all_steps = QC_STEPS + RNA_QC_STEPS
+
+        def _rank(instrument):
+            if not instrument:
+                return 99
+            i = instrument.lower()
+            if "qubit" in i:
+                return 0
+            if "nanodrop" in i or "nano" in i:
+                return 1
+            return 2  # FemtoPulse 등 — total_amount 없으므로 실질적으로 사용 안 됨
+
+        # Pass 1: step별 최우선 total_amount 결정 (Qubit > NanoDrop)
+        best: dict = {}  # step -> (total_amount, rank)
+        for m in metrics:
+            if m.total_amount is None:
+                continue
+            r = _rank(m.instrument)
+            if m.step not in best or r < best[m.step][1]:
+                best[m.step] = (m.total_amount, r)
+
+        # Pass 2: 각 metric 행의 recovery 계산
         results = []
         for m in metrics:
             recovery_str = "-"
             if m.total_amount is not None:
-                step_idx = (
-                    QC_STEPS.index(m.step) if m.step in QC_STEPS else -1
-                )
+                step_idx = _all_steps.index(m.step) if m.step in _all_steps else -1
                 if step_idx > 0:
-                    prev_step = QC_STEPS[step_idx - 1]
-                    prev_total = prev_total_map.get(prev_step)
-                    if prev_total is not None and prev_total > 0:
+                    prev_step = _all_steps[step_idx - 1]
+                    prev_entry = best.get(prev_step)
+                    if prev_entry is not None and prev_entry[0] > 0:
                         recovery_str = (
-                            f"{(m.total_amount / prev_total) * 100:.1f}%"
+                            f"{(m.total_amount / prev_entry[0]) * 100:.1f}%"
                         )
-                prev_total_map[m.step] = m.total_amount
             results.append(recovery_str)
         return results
 
@@ -724,6 +927,12 @@ class SampleTab(QWidget):
         """새 샘플 등록 다이얼로그."""
         dlg = SampleDialog(self)
         if dlg.exec_() == SampleDialog.Accepted:
+            self.refresh_samples()
+
+    def _open_batch_register(self):
+        """배치 샘플 등록 다이얼로그."""
+        dlg = BatchSampleDialog(self)
+        if dlg.exec_() == BatchSampleDialog.Accepted:
             self.refresh_samples()
 
     def _open_edit_sample(self):

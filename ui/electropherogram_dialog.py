@@ -120,6 +120,22 @@ class ElectropherogramDialog(QDialog):
         self._setup_legend_pick()
         self._load_settings()   # 저장된 설정 복원 (창 크기, 스플리터, 범위)
 
+        self._splitter.splitterMoved.connect(lambda: self._update_trace_labels())
+
+    def _update_trace_labels(self):
+        """좌측 패널 현재 폭에 맞춰 체크박스 텍스트를 동적으로 elide."""
+        panel_width = self._splitter.sizes()[0]
+        # 체크박스 indicator(~20px) + icon(~16px) + margins(~12px) 제외
+        available = max(40, panel_width - 48)
+        for label, cb in self._checkboxes.items():
+            full = self._label_full.get(label, label)
+            elided = cb.fontMetrics().elidedText(full, Qt.ElideRight, available)
+            cb.setText(elided)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._update_trace_labels()
+
     # ------------------------------------------------------------------ #
     #  Coordinate helpers                                                  #
     # ------------------------------------------------------------------ #
@@ -166,6 +182,8 @@ class ElectropherogramDialog(QDialog):
         trace_layout.setSpacing(2)
         trace_layout.setContentsMargins(2, 2, 2, 2)
 
+        self._label_full: Dict[str, str] = {}   # QCheckBox key → full label text
+
         for label, line in self._lines.items():
             cb = QCheckBox()
             cb.setChecked(True)
@@ -176,11 +194,11 @@ class ElectropherogramDialog(QDialog):
                 cb.setIcon(QIcon(px))
             except Exception:
                 pass
-            display = label if len(label) <= 24 else label[:21] + "…"
-            cb.setText(display)
+            cb.setText(label)   # full text — elide dynamically via _update_trace_labels
             cb.setToolTip(label)
             cb.toggled.connect(lambda checked, lbl=label: self._on_checkbox_changed(lbl, checked))
             self._checkboxes[label] = cb
+            self._label_full[label] = label
             trace_layout.addWidget(cb)
 
         trace_layout.addStretch()

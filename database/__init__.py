@@ -36,6 +36,8 @@ from database.db_manager import (
     get_sequencing_results_by_sample,
     delete_sequencing_result,
     get_all_sequencing_results,
+    rejudge_all_metrics,
+    rename_sample_id,
 )
 
 __all__ = [
@@ -76,4 +78,6 @@ __all__ = [
     'update_project',
     'get_children_by_sample',
     'get_re_extraction_count',
+    'rejudge_all_metrics',
+    'rename_sample_id',
 ]

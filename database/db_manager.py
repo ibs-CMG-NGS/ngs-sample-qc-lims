@@ -481,3 +481,137 @@ def get_all_sequencing_results(session):
     from database.models import SequencingResult
     return session.query(SequencingResult).order_by(SequencingResult.measured_at).all()
 
+
+def rejudge_all_metrics(session) -> dict:
+    """모든 QCMetric 레코드를 현재 판정 기준으로 재판정해 status를 갱신한다.
+
+    Returns:
+        {"total": int, "updated": int, "by_type": {"WGS": {"Pass": n, ...}, ...}}
+    """
+    from analysis.qc_judge import qc_judge
+    from database.models import QCMetric, Sample
+
+    metrics = session.query(QCMetric).all()
+    sample_type_cache: dict = {}
+
+    total = 0
+    updated = 0
+    by_type: dict = {}
+
+    for m in metrics:
+        sample_type = sample_type_cache.get(m.sample_id)
+        if sample_type is None:
+            sample = session.query(Sample).filter_by(sample_id=m.sample_id).first()
+            sample_type = sample.sample_type if sample else ""
+            sample_type_cache[m.sample_id] = sample_type
+
+        qc_data = {
+            "concentration":   m.concentration,
+            "volume":          m.volume,
+            "total_amount":    m.total_amount,
+            "gqn_rin":         m.gqn_rin,
+            "avg_size":        m.avg_size,
+            "purity_260_280":  m.purity_260_280,
+            "purity_260_230":  m.purity_260_230,
+        }
+        # For RNA Femto Pulse metrics: compute MQI and %CV from SmearAnalysis
+        if 'rna' in (sample_type or '').lower() and m.instrument == 'Femto Pulse':
+            from database.models import SmearAnalysis
+            import re as _re
+
+            smears = (session.query(SmearAnalysis)
+                      .filter_by(sample_id=m.sample_id, step=m.step)
+                      .all())
+            if smears:
+                def _span(rt):
+                    nums = [float(n) for n in _re.findall(r'\d+(?:\.\d+)?',
+                                                           str(rt).replace(',', ''))]
+                    return (nums[1] - nums[0]) if len(nums) >= 2 else 0.0
+
+                step_map = {(sa.range_text or ''): sa for sa in smears}
+                if step_map:
+                    widest_key = max(step_map, key=_span)
+                    total_sa = step_map[widest_key]
+                    if total_sa.cv is not None:
+                        qc_data['cv_total'] = total_sa.cv
+                    pct_low = 0.0
+                    pct_high = 0.0
+                    has_sub = False
+                    for rng_text, sa in step_map.items():
+                        if rng_text == widest_key:
+                            continue
+                        if sa.pct_total is None:
+                            continue
+                        if _re.search(r'marker|ladder', rng_text, _re.IGNORECASE):
+                            continue
+                        nums = [float(n) for n in _re.findall(r'\d+(?:\.\d+)?',
+                                                               rng_text.replace(',', ''))]
+                        if not nums:
+                            continue
+                        mid = (nums[0] + (nums[1] if len(nums) >= 2 else nums[0] * 5)) / 2
+                        has_sub = True
+                        if mid < 1000:
+                            pct_low += sa.pct_total
+                        else:
+                            pct_high += sa.pct_total
+                    if has_sub:
+                        denom = pct_low + pct_high
+                        if denom > 0:
+                            qc_data['mqi'] = pct_high / denom
+        new_status = qc_judge.judge_qc(sample_type, qc_data)
+
+        total += 1
+        by_type.setdefault(sample_type, {})
+        by_type[sample_type][new_status] = by_type[sample_type].get(new_status, 0) + 1
+
+        if new_status != m.status:
+            m.status = new_status
+            updated += 1
+
+    return {"total": total, "updated": updated, "by_type": by_type}
+
+
+def rename_sample_id(session, old_id: str, new_id: str) -> None:
+    """Sample ID를 변경하고 모든 자식 테이블의 FK를 일괄 업데이트한다.
+
+    SQLite는 FK 제약이 기본 비활성화 상태이므로 raw SQL UPDATE로 처리한다.
+    session.commit()은 호출자(session_scope)가 담당한다.
+
+    Raises:
+        ValueError: new_id가 이미 존재하거나 old_id를 찾을 수 없을 때
+    """
+    if old_id == new_id:
+        return
+
+    # 존재 확인
+    from database.models import Sample
+    if not session.query(Sample).filter_by(sample_id=old_id).first():
+        raise ValueError(f"Sample '{old_id}' not found.")
+    if session.query(Sample).filter_by(sample_id=new_id).first():
+        raise ValueError(f"Sample ID '{new_id}' already exists.")
+
+    # 자식 테이블 FK 먼저 업데이트 (FK 제약 위반 방지)
+    child_tables = [
+        "qc_metrics",
+        "raw_traces",
+        "smear_analyses",
+        "sequencing_results",
+        "sample_notes",
+    ]
+    for table in child_tables:
+        session.execute(
+            text(f"UPDATE {table} SET sample_id = :new WHERE sample_id = :old"),
+            {"new": new_id, "old": old_id},
+        )
+
+    # parent_sample_id 참조 업데이트 (분기 샘플)
+    session.execute(
+        text("UPDATE samples SET parent_sample_id = :new WHERE parent_sample_id = :old"),
+        {"new": new_id, "old": old_id},
+    )
+
+    # 부모 레코드 업데이트
+    session.execute(
+        text("UPDATE samples SET sample_id = :new WHERE sample_id = :old"),
+        {"new": new_id, "old": old_id},
+    )

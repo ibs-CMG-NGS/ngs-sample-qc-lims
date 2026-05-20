@@ -296,9 +296,17 @@ class QCVisualizer:
             return x_interp
 
         lines_dict = {}  # label → Line2D, for interactive toggling in the dialog
+        _label_counts: dict = {}   # 중복 step 이름 → 발생 횟수 (고유 label 보장)
         max_data_time = None  # 실제 플롯된 데이터의 최대 x (migration time)
         for i, trace in enumerate(traces):
             step = trace.get('step', f'Step {i + 1}')
+            # 중복 step 이름에 순서 번호를 붙여 lines_dict key를 유일하게 유지
+            if step in _label_counts:
+                _label_counts[step] += 1
+                label = f"{step} ({_label_counts[step]})"
+            else:
+                _label_counts[step] = 1
+                label = step
             x_bp = trace.get('time_sec') if trace.get('time_sec') is not None else trace.get('size_bp', [])
             rfu = trace.get('rfu', [])
 
@@ -307,8 +315,8 @@ class QCVisualizer:
                     x = _bp_to_time(np.asarray(x_bp, dtype=float))
                 else:
                     x = np.asarray(x_bp, dtype=float)
-                line = ax.plot(x, rfu, label=step, color=colors[i], linewidth=1.5)[0]
-                lines_dict[step] = line
+                line = ax.plot(x, rfu, label=label, color=colors[i], linewidth=1.5)[0]
+                lines_dict[label] = line
                 x_max = float(np.max(x))
                 if max_data_time is None or x_max > max_data_time:
                     max_data_time = x_max

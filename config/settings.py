@@ -68,8 +68,21 @@ QC_CRITERIA = {
     },
     "mRNA-seq": {
         "RIN": {
-            "pass": 8.0,
-            "warning": 6.0
+            "pass": 7.0,
+            "warning": 5.0
+        },
+        # Qubit/NanoDrop total amount 기준 (1 µg = 1000 ng 이상 Pass, 미만 Warning, Fail 없음)
+        "total_amount": {
+            "pass": 1000.0,
+        },
+        # Femto Pulse smear analysis — concentration-independent integrity metrics
+        "MQI": {
+            "pass": 0.65,
+            "warning": 0.50,
+        },
+        "CV": {
+            "pass": 70.0,
+            "warning": 85.0,
         },
         # 참고용 — 판정에 사용하지 않음
         "purity_260_280": {

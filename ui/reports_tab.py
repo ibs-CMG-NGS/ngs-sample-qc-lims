@@ -81,6 +81,79 @@ def _fmt(val, decimals: int = 2) -> str:
     return f"{val:.{decimals}f}"
 
 
+def _smear_low_high(step_smears: dict):
+    """Parse RNA smear ranges into (pct_low, pct_high).
+
+    Widest-span range = Total → excluded to avoid double-counting.
+    Remaining: midpoint < 1000 → low, midpoint >= 1000 → high.
+    Returns (pct_low, pct_high) floats, or (None, None) if no data.
+    """
+    import re
+
+    def _span(rt):
+        nums = [float(n) for n in re.findall(r'\d+(?:\.\d+)?',
+                                              str(rt).replace(',', ''))]
+        return (nums[1] - nums[0]) if len(nums) >= 2 else 0.0
+
+    if not step_smears:
+        return None, None
+
+    total_key = max(step_smears, key=_span)
+    pct_low = 0.0
+    pct_high = 0.0
+    has_data = False
+
+    for rng_text, sa in step_smears.items():
+        if rng_text == total_key:
+            continue
+        if sa.pct_total is None:
+            continue
+        text = str(rng_text).replace(',', '')
+        if re.search(r'marker|ladder', text, re.IGNORECASE):
+            continue
+        nums = [float(n) for n in re.findall(r'\d+(?:\.\d+)?', text)]
+        if not nums:
+            continue
+        start = nums[0]
+        end = nums[1] if len(nums) >= 2 else start * 5
+        mid = (start + end) / 2
+        has_data = True
+        if mid < 1000:
+            pct_low += sa.pct_total
+        else:
+            pct_high += sa.pct_total
+
+    return (pct_low, pct_high) if has_data else (None, None)
+
+
+def _widest_cv(step_smears: dict) -> str:
+    """Return %CV string from the widest-span smear range (= Total range)."""
+    import re
+
+    def _span(rt):
+        nums = [float(n) for n in re.findall(r'\d+(?:\.\d+)?',
+                                              str(rt).replace(',', ''))]
+        return (nums[1] - nums[0]) if len(nums) >= 2 else 0.0
+
+    if not step_smears:
+        return "-"
+    widest_key = max(step_smears, key=_span)
+    sa = step_smears.get(widest_key)
+    if sa is None or sa.cv is None:
+        return "-"
+    return f"{sa.cv:.1f}"
+
+
+def _compute_mqi(step_smears: dict) -> str:
+    """MQI = High% / (Low% + High%) — 0-1 scale, higher = more intact RNA."""
+    pct_low, pct_high = _smear_low_high(step_smears)
+    if pct_high is not None and pct_low is not None:
+        denom = pct_low + pct_high
+        if denom > 0:
+            return f"{pct_high / denom:.2f}"
+    return "-"
+
+
 # ════════════════════════════════════════════════════════════════════
 # Reports 탭 메인 위젯
 # ════════════════════════════════════════════════════════════════════
@@ -123,6 +196,10 @@ class ReportsTab(QWidget):
         self.btn_excel.clicked.connect(self._export_excel)
         self.btn_excel.setEnabled(HAS_OPENPYXL)
         hdr.addWidget(self.btn_excel)
+
+        self.btn_html = QPushButton("Export HTML (selected)")
+        self.btn_html.clicked.connect(self._export_html)
+        hdr.addWidget(self.btn_html)
 
         root.addLayout(hdr)
 
@@ -175,6 +252,9 @@ class ReportsTab(QWidget):
         self.sel_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.sel_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.sel_table.setAlternatingRowColors(True)
+        self.sel_table.setSortingEnabled(True)
+        self.sel_table.horizontalHeader().setSortIndicatorShown(True)
+        self.sel_table.verticalHeader().setVisible(False)
         self.sel_table.currentCellChanged.connect(self._on_row_selected)
         self.sel_table.itemChanged.connect(self._on_checkbox_changed)
         left_layout.addWidget(self.sel_table)
@@ -237,8 +317,15 @@ class ReportsTab(QWidget):
                 samples = get_all_samples(session)
 
                 # session 밖에서 쓸 수 있도록 dict 형태로 스냅샷
-                self._samples_cache = [
-                    {
+                # get_all_samples은 created_at DESC 정렬 → 첫 등장이 최신 레코드
+                _seen_ids: set = set()
+                _cache_raw = []
+                for s in samples:
+                    if s.sample_id in _seen_ids:
+                        logger.warning(f"Duplicate sample_id in DB: {s.sample_id} — skipping older record")
+                        continue
+                    _seen_ids.add(s.sample_id)
+                    _cache_raw.append({
                         "sample_id": s.sample_id,
                         "sample_name": s.sample_name or "",
                         "sample_type": s.sample_type or "",
@@ -246,9 +333,8 @@ class ReportsTab(QWidget):
                         "material": getattr(s, "material", None) or "",
                         "description": s.description or "",
                         "project": getattr(s, "project", None) or "",
-                    }
-                    for s in samples
-                ]
+                    })
+                self._samples_cache = _cache_raw
 
                 # 전체 QC 레코드 중 가장 나쁜 status를 overall로 사용
                 _sorder = {"Fail": 0, "Warning": 1, "Pass": 2}
@@ -332,13 +418,14 @@ class ReportsTab(QWidget):
 
         self.sel_table.blockSignals(False)
 
-    def _get_checked_ids(self) -> set:
-        ids = set()
+    def _get_checked_ids(self) -> list:
+        """테이블 표시 순서를 유지한 채 선택된 Sample ID 목록 반환."""
+        ids = []
         for row in range(self.sel_table.rowCount()):
             chk = self.sel_table.item(row, 0)
             sid = self.sel_table.item(row, 1)
             if chk and sid and chk.checkState() == Qt.Checked:
-                ids.add(sid.text())
+                ids.append(sid.text())
         return ids
 
     def _select_all(self):
@@ -460,7 +547,12 @@ class ReportsTab(QWidget):
             self._prev_canvas.draw()
             return
 
-        steps = [m["step"] or "?" for m in metrics]
+        # Two-line x-tick labels: step name + instrument abbreviation
+        steps = [
+            f"{(m['step'] or '?')}\n({_short_instrument(m.get('instrument', ''))})"
+            if m.get('instrument') else (m['step'] or '?')
+            for m in metrics
+        ]
         concs = [m["concentration"] or 0 for m in metrics]
         gqns  = [m["gqn_rin"] or 0 for m in metrics]
         statuses = [m["status"] or "No Data" for m in metrics]
@@ -471,10 +563,13 @@ class ReportsTab(QWidget):
         bars1 = ax1.bar(x, concs, color=bar_colors, edgecolor="white", linewidth=0.8)
         ax1.set_title("Concentration (ng/µl)", fontsize=9, fontweight="bold")
         ax1.set_xticks(x)
-        ax1.set_xticklabels(steps, rotation=25, ha="right", fontsize=7)
+        ax1.set_xticklabels(steps, rotation=35, ha="right", fontsize=7, linespacing=1.2)
         ax1.tick_params(axis="y", labelsize=7)
         ax1.spines[["top", "right"]].set_visible(False)
         ax1.set_facecolor("#FAFAFA")
+        max_c = max((v for v in concs if v), default=0)
+        if max_c > 0:
+            ax1.set_ylim(0, max_c * 1.28)
         for bar, val in zip(bars1, concs):
             if val > 0:
                 ax1.text(bar.get_x() + bar.get_width() / 2,
@@ -485,10 +580,13 @@ class ReportsTab(QWidget):
         bars2 = ax2.bar(x, gqns, color=bar_colors, edgecolor="white", linewidth=0.8)
         ax2.set_title("GQN / RIN", fontsize=9, fontweight="bold")
         ax2.set_xticks(x)
-        ax2.set_xticklabels(steps, rotation=25, ha="right", fontsize=7)
+        ax2.set_xticklabels(steps, rotation=35, ha="right", fontsize=7, linespacing=1.2)
         ax2.tick_params(axis="y", labelsize=7)
         ax2.spines[["top", "right"]].set_visible(False)
         ax2.set_facecolor("#FAFAFA")
+        max_g = max((v for v in gqns if v), default=0)
+        if max_g > 0:
+            ax2.set_ylim(0, max_g * 1.28)
         for bar, val in zip(bars2, gqns):
             if val > 0:
                 ax2.text(bar.get_x() + bar.get_width() / 2,
@@ -496,13 +594,13 @@ class ReportsTab(QWidget):
                          ha="center", va="bottom", fontsize=7)
 
         self._prev_fig.suptitle(f"QC Preview — {sample_id}", fontsize=9, y=1.01)
-        self._prev_fig.tight_layout(pad=0.6)
+        self._prev_fig.tight_layout(pad=1.2)
         self._prev_canvas.draw()
 
     # ── PDF 내보내기 ─────────────────────────────────────────────────
 
     def _export_pdf(self):
-        selected_ids = sorted(self._get_checked_ids())
+        selected_ids = self._get_checked_ids()   # 테이블 순서 유지
         if not selected_ids:
             QMessageBox.information(self, "No Selection",
                                     "Check at least one sample in the list.")
@@ -522,12 +620,19 @@ class ReportsTab(QWidget):
 
         try:
             with PdfPages(save_path) as pdf:
-                # 1) Batch overview (한 페이지)
+                # bbox_inches 없이 저장해야 모든 페이지가 정확히 A4(8.27×11.69)로 통일됨
+
+                # 1) 표지
+                cover_fig = _build_cover_page(selected_ids, snap_map)
+                pdf.savefig(cover_fig)
+                plt.close(cover_fig)
+
+                # 2) 배치 요약 (step-status table + 3 batch charts)
                 overview_fig = _build_batch_overview(selected_ids, snap_map)
-                pdf.savefig(overview_fig, bbox_inches="tight")
+                pdf.savefig(overview_fig)
                 plt.close(overview_fig)
 
-                # 2) 샘플별 combined 페이지 (QC table + electropherogram)
+                # 3) 샘플별 페이지 (차트 3개 + QC 표 + 전기영동 한 페이지)
                 for sid in selected_ids:
                     snap = snap_map.get(sid, {
                         "sample_id": sid, "sample_name": "",
@@ -547,13 +652,14 @@ class ReportsTab(QWidget):
                                     "total_amount": m.total_amount,
                                     "gqn_rin": m.gqn_rin,
                                     "avg_size": m.avg_size,
+                                    "peak_size": m.peak_size,
                                     "status": m.status,
                                     "measured_at": m.measured_at,
                                 }
                                 for m in metrics
                             ]
                             fig = _build_sample_combined_page(sid, snap, metrics_dicts, session)
-                            pdf.savefig(fig, bbox_inches="tight")
+                            pdf.savefig(fig)
                             plt.close(fig)
 
                     except Exception as e:
@@ -572,7 +678,7 @@ class ReportsTab(QWidget):
     # ── Excel 내보내기 ────────────────────────────────────────────────
 
     def _export_excel(self):
-        selected_ids = sorted(self._get_checked_ids())
+        selected_ids = self._get_checked_ids()   # 테이블 순서 유지
         if not selected_ids:
             QMessageBox.information(self, "No Selection",
                                     "Check at least one sample in the list.")
@@ -598,6 +704,39 @@ class ReportsTab(QWidget):
         except Exception as e:
             logger.error(f"Excel export failed: {e}")
             QMessageBox.critical(self, "Export Error", f"Failed to save Excel:\n{e}")
+
+    # ── HTML 내보내기 ─────────────────────────────────────────────────
+
+    def _export_html(self):
+        selected_ids = self._get_checked_ids()
+        if not selected_ids:
+            QMessageBox.information(self, "No Selection",
+                                    "Check at least one sample in the list.")
+            return
+
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select Output Folder", str(REPORTS_DIR)
+        )
+        if not folder:
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_dir = Path(folder) / f"NGS_QC_Report_{timestamp}"
+        report_dir.mkdir(parents=True, exist_ok=True)
+
+        snap_map = {s["sample_id"]: s for s in self._samples_cache}
+
+        try:
+            from ui.html_report import generate_html_report
+            generate_html_report(selected_ids, snap_map, report_dir)
+            index_path = report_dir / "index.html"
+            QMessageBox.information(
+                self, "Export Complete",
+                f"HTML report saved to:\n{index_path}"
+            )
+        except Exception as e:
+            logger.error(f"HTML export failed: {e}")
+            QMessageBox.critical(self, "Export Error", f"Failed to save HTML:\n{e}")
 
     # ── GUI 상태 저장/복원 ────────────────────────────────────────────
 
@@ -630,12 +769,140 @@ class ReportsTab(QWidget):
 # PDF 빌더 함수 (모듈 레벨)
 # ════════════════════════════════════════════════════════════════════
 
+def _criteria_note(sample_type: str) -> str:
+    """샘플 타입별 QC 판정 기준 한 줄 주석 — config/settings.py에서 동적 로드."""
+    from config.settings import QC_CRITERIA
+    if sample_type == "WGS":
+        gqn_c = QC_CRITERIA.get("WGS", {}).get("GQN", {})
+        gp = gqn_c.get("pass", 7.0)
+        gw = gqn_c.get("warning", 5.0)
+        return (
+            f"판정 기준 ┃ GQN (Femto Pulse) : Pass ≥ {gp}  /  Warning {gw} – {gp - 0.1:.1f}  /  Fail < {gw}"
+            "   ┃  농도 (Qubit/NanoDrop) : 참고용 (판정 미사용)"
+        )
+    elif sample_type == "mRNA-seq":
+        from config.settings import QC_CRITERIA
+        rin_c = QC_CRITERIA.get("mRNA-seq", {}).get("RIN", {})
+        rp = rin_c.get("pass", 7.0)
+        rw = rin_c.get("warning", 5.0)
+        return (
+            f"판정 기준 ┃ RIN (Femto Pulse) : Pass ≥ {rp}  /  Warning {rw} – {rp - 0.1:.1f}  /  Fail < {rw}"
+            "   ┃  Total RNA (Qubit/NanoDrop) : Pass ≥ 1,000 ng (1 µg)  /  Warning < 1,000 ng  /  Fail 없음"
+        )
+    return ""
+
+
+def _instrument_rank(instrument: Optional[str]) -> int:
+    """Qubit(0) > NanoDrop(1) > FemtoPulse(2) > 기타(99)."""
+    if not instrument:
+        return 99
+    i = instrument.lower()
+    if "qubit" in i:
+        return 0
+    if "nanodrop" in i or "nano" in i:
+        return 1
+    if "femto" in i:
+        return 2
+    return 3
+
+
+def _short_instrument(instrument: Optional[str]) -> str:
+    """Abbreviated instrument label for bar chart x-axis."""
+    if not instrument:
+        return ""
+    i = instrument.lower()
+    if "qubit" in i:
+        return "Qubit"
+    if "nanodrop" in i or "nano" in i:
+        return "NanoDrop"
+    if "femto" in i:
+        return "FP"
+    return instrument[:8]
+
+
+def _collect_per_sample_data(sample_ids: List[str]) -> dict:
+    """샘플별 total_amount / gqn_rin / concentration 수집.
+
+    concentration은 Qubit > NanoDrop > FemtoPulse 우선순위로 선택.
+    반환: {sid: {total_amount, amount_status, gqn_rin, rin_status,
+                 concentration, conc_status}}
+    """
+    result: dict = {}
+    for sid in sample_ids:
+        data: dict = {
+            "total_amount": None, "amount_status": "No Data",
+            "gqn_rin":      None, "rin_status":    "No Data",
+            "concentration": None, "conc_status":  "No Data",
+        }
+        best_conc_rank = 99
+        try:
+            with db_manager.session_scope() as session:
+                metrics = get_qc_metrics_by_sample(session, sid)
+                # measured_at 기준 최신순 정렬
+                sorted_metrics = sorted(
+                    metrics,
+                    key=lambda m: m.measured_at or datetime.min,
+                    reverse=True,
+                )
+                for m in sorted_metrics:
+                    if m.total_amount is not None and data["total_amount"] is None:
+                        data["total_amount"] = m.total_amount
+                        data["amount_status"] = m.status or "No Data"
+                    if m.gqn_rin is not None and data["gqn_rin"] is None:
+                        data["gqn_rin"] = m.gqn_rin
+                        data["rin_status"] = m.status or "No Data"
+                    rank = _instrument_rank(m.instrument)
+                    if m.concentration is not None and rank < best_conc_rank:
+                        data["concentration"] = m.concentration
+                        best_conc_rank = rank
+                        data["conc_status"] = m.status or "No Data"
+        except Exception:
+            pass
+        result[sid] = data
+    return result
+
+
+def _bar_chart(ax, sample_ids: List[str], values: list, statuses: list,
+               ylabel: str, title: str, fmt: str = "{:.1f}",
+               thresholds: Optional[list] = None):
+    """샘플별 bar chart 공통 헬퍼.
+
+    thresholds: [(value, color, label), ...]
+    """
+    x = np.arange(len(sample_ids))
+    colors = [_STATUS_MPL.get(s, "#9E9E9E") for s in statuses]
+    bars = ax.bar(x, [v if v is not None else 0 for v in values],
+                  color=colors, edgecolor="white", linewidth=0.4, alpha=0.88)
+
+    if thresholds:
+        for thr_val, thr_color, thr_label in thresholds:
+            ax.axhline(thr_val, color=thr_color, linewidth=0.9,
+                       linestyle="--", alpha=0.85, label=thr_label)
+        ax.legend(fontsize=5.5, loc="upper right",
+                  framealpha=0.7, edgecolor="none")
+
+    # 값 레이블
+    for bar, val in zip(bars, values):
+        if val is not None and val > 0:
+            ax.text(bar.get_x() + bar.get_width() / 2,
+                    bar.get_height(),
+                    fmt.format(val),
+                    ha="center", va="bottom", fontsize=5.5, color="#333333")
+
+    short_ids = [sid.split("-")[-1] if "-" in sid else sid for sid in sample_ids]
+    ax.set_xticks(x)
+    ax.set_xticklabels(short_ids, rotation=45, ha="right", fontsize=6)
+    ax.set_ylabel(ylabel, fontsize=6.5)
+    ax.tick_params(axis="y", labelsize=6)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.set_facecolor("#FAFAFA")
+    ax.set_title(title, fontsize=8, fontweight="bold", loc="left", color="#1A237E")
+
+
 def _build_batch_overview(sample_ids: List[str], snap_map: dict) -> "plt.Figure":
-    """PDF 첫 페이지: 배치 전체 개요 — step-status table + charts. Portrait A4."""
+    """PDF 첫 페이지: step-status table + 3 per-sample charts. Portrait A4."""
     _order = {"Pass": 0, "Warning": 1, "Fail": 2}
     step_statuses: dict = {}
-    conc_by_step: dict = {}   # {step: [ng/ul, ...]}
-    gqn_by_step: dict = {}    # {step: [gqn, ...]}
 
     for sid in sample_ids:
         by_step: dict = {}
@@ -648,15 +915,10 @@ def _build_batch_overview(sample_ids: List[str], snap_map: dict) -> "plt.Figure"
                         prev = by_step.get(m.step)
                         if prev is None or _order[s] > _order.get(prev, -1):
                             by_step[m.step] = s
-                    if m.concentration is not None:
-                        conc_by_step.setdefault(m.step, []).append(m.concentration)
-                    if m.gqn_rin is not None:
-                        gqn_by_step.setdefault(m.step, []).append(m.gqn_rin)
         except Exception:
             pass
         step_statuses[sid] = by_step
 
-    # 데이터가 있는 step만 표준 순서로
     steps_with_data: set = set()
     for by_step in step_statuses.values():
         steps_with_data.update(by_step.keys())
@@ -684,23 +946,34 @@ def _build_batch_overview(sample_ids: List[str], snap_map: dict) -> "plt.Figure"
         st = snap_map.get(sid, {}).get("latest_status", "No Data")
         status_counts[st] = status_counts.get(st, 0) + 1
 
+    # ── per-sample 지표 수집 ─────────────────────────────────────────
+    per_sample = _collect_per_sample_data(sample_ids)
+
+    amounts  = [per_sample[sid]["total_amount"]  for sid in sample_ids]
+    amt_st   = [per_sample[sid]["amount_status"] for sid in sample_ids]
+    rins     = [per_sample[sid]["gqn_rin"]       for sid in sample_ids]
+    rin_st   = [per_sample[sid]["rin_status"]    for sid in sample_ids]
+    concs    = [per_sample[sid]["concentration"] for sid in sample_ids]
+    conc_st  = [per_sample[sid]["conc_status"]   for sid in sample_ids]
+
+    # ── Figure (portrait A4) ─────────────────────────────────────────
     fig = plt.figure(figsize=(8.27, 11.69))
     fig.patch.set_facecolor("white")
 
     gs = gridspec.GridSpec(
-        3, 1, figure=fig,
-        height_ratios=[0.6, 3.5, 2.8],
-        hspace=0.45,
-        left=0.048, right=0.952, top=0.963, bottom=0.034,
+        5, 1, figure=fig,
+        height_ratios=[0.4, 2.2, 1.3, 1.3, 1.3],
+        hspace=0.65,
+        left=0.07, right=0.95, top=0.963, bottom=0.034,
     )
 
-    # ── 헤더 ────────────────────────────────────────────────────────
+    # ── 헤더 ─────────────────────────────────────────────────────────
     ax_hdr = fig.add_subplot(gs[0])
     ax_hdr.axis("off")
     ax_hdr.text(0, 1.0, "NGS Sample QC Report — Batch Overview",
                 transform=ax_hdr.transAxes, fontsize=13, fontweight="bold",
                 va="top", color="#1A237E")
-    ax_hdr.text(0, 0.50,
+    ax_hdr.text(0, 0.40,
                 f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}  |  "
                 f"Total: {len(sample_ids)} sample(s)",
                 transform=ax_hdr.transAxes, fontsize=8, va="top", color="#555555")
@@ -708,99 +981,121 @@ def _build_batch_overview(sample_ids: List[str], snap_map: dict) -> "plt.Figure"
     for st in ("Pass", "Warning", "Fail", "No Data"):
         cnt = status_counts.get(st, 0)
         ax_hdr.text(stat_x, 0.0, f"{st}: {cnt}",
-                    transform=ax_hdr.transAxes, fontsize=9, fontweight="bold",
+                    transform=ax_hdr.transAxes, fontsize=8, fontweight="bold",
                     color=_STATUS_MPL.get(st, "#9E9E9E"), va="bottom")
         stat_x += 0.22
 
-    # ── Step-status table ────────────────────────────────────────────
+    # ── Step-status table ─────────────────────────────────────────────
     ax_tbl = fig.add_subplot(gs[1])
     ax_tbl.axis("off")
     ax_tbl.set_title("QC Step Status", fontsize=9, fontweight="bold",
                      loc="left", pad=4, color="#1A237E")
-
     if tbl_data:
         tbl = ax_tbl.table(
-            cellText=tbl_data,
-            colLabels=tbl_cols,
-            loc="upper center",
-            cellLoc="center",
+            cellText=tbl_data, colLabels=tbl_cols,
+            loc="upper center", cellLoc="center",
             bbox=[0.0, 0.0, 1.0, 0.96],
         )
         tbl.auto_set_font_size(False)
-        tbl.set_fontsize(6.5)
+        tbl.set_fontsize(6.0)
         tbl.auto_set_column_width(list(range(len(tbl_cols))))
-
         for col in range(len(tbl_cols)):
             cell = tbl[0, col]
             cell.set_facecolor("#1A237E")
-            cell.set_text_props(color="white", fontweight="bold", fontsize=6.5)
-            cell.set_height(cell.get_height() * 1.6)
-
+            cell.set_text_props(color="white", fontweight="bold", fontsize=6.0)
+            cell.set_height(cell.get_height() * 1.5)
         for row_idx, row_data in enumerate(tbl_data):
             for col_idx in range(n_info, len(tbl_cols)):
                 st = row_data[col_idx]
                 color = _STATUS_MPL.get(st)
                 if color and st != "-":
                     tbl[row_idx + 1, col_idx].set_facecolor(color)
-                    tbl[row_idx + 1, col_idx].set_text_props(
-                        color="white", fontweight="bold"
-                    )
+                    tbl[row_idx + 1, col_idx].set_text_props(color="white", fontweight="bold")
             if row_idx % 2 == 1:
                 for col in range(n_info):
                     tbl[row_idx + 1, col].set_facecolor("#F3F4F6")
 
-    # ── Charts ──────────────────────────────────────────────────────
-    gs_c = gridspec.GridSpecFromSubplotSpec(1, 2, subplot_spec=gs[2], wspace=0.45)
-    ax_pie = fig.add_subplot(gs_c[0])
-    ax_bar = fig.add_subplot(gs_c[1])
-
-    # 왼쪽: 전체 상태 파이 차트
-    pie_labels, pie_sizes, pie_colors = [], [], []
-    for st in ("Pass", "Warning", "Fail", "No Data"):
-        cnt = status_counts.get(st, 0)
-        if cnt > 0:
-            pie_labels.append(f"{st}\n({cnt})")
-            pie_sizes.append(cnt)
-            pie_colors.append(_STATUS_MPL.get(st, "#9E9E9E"))
-    if pie_sizes:
-        ax_pie.pie(pie_sizes, labels=pie_labels, colors=pie_colors,
-                   autopct="%1.0f%%", startangle=90,
-                   textprops={"fontsize": 7})
-        ax_pie.set_title("Overall Status", fontsize=9, fontweight="bold")
+    # ── Chart 1: Total Amount ─────────────────────────────────────────
+    ax_amt = fig.add_subplot(gs[2])
+    if any(v is not None for v in amounts):
+        _bar_chart(ax_amt, sample_ids, amounts, amt_st,
+                   "Total Amount (ng)", "Total Amount (ng)", fmt="{:.0f}")
     else:
-        ax_pie.axis("off")
+        ax_amt.text(0.5, 0.5, "No total amount data", ha="center", va="center",
+                    transform=ax_amt.transAxes, color="#9E9E9E", fontsize=8)
+        ax_amt.axis("off")
 
-    # 오른쪽: step별 평균 농도 bar chart
-    steps_to_plot = [s for s in step_list if s in conc_by_step]
-    if steps_to_plot:
-        x = np.arange(len(steps_to_plot))
-        avgs = [np.mean(conc_by_step[s]) for s in steps_to_plot]
-        bars = ax_bar.bar(x, avgs, color="#1A237E", edgecolor="white",
-                          linewidth=0.6, alpha=0.82)
-        ax_bar.set_xticks(x)
-        ax_bar.set_xticklabels(
-            [_STEP_ABBREV.get(s, s).replace("\n", " ") for s in steps_to_plot],
-            rotation=30, ha="right", fontsize=6.5,
-        )
-        ax_bar.set_ylabel("Avg Conc. (ng/µl)", fontsize=7)
-        ax_bar.tick_params(axis="y", labelsize=7)
-        ax_bar.spines[["top", "right"]].set_visible(False)
-        ax_bar.set_facecolor("#FAFAFA")
-        ax_bar.set_title("Avg Concentration by Step", fontsize=9, fontweight="bold")
-        for bar, val in zip(bars, avgs):
-            if val > 0:
-                ax_bar.text(bar.get_x() + bar.get_width() / 2,
-                            bar.get_height(), f"{val:.2f}",
-                            ha="center", va="bottom", fontsize=6.5)
+    # ── Chart 2: GQN / RIN ───────────────────────────────────────────
+    ax_rin = fig.add_subplot(gs[3])
+    if any(v is not None for v in rins):
+        from config.settings import QC_CRITERIA as _QC_C
+        _rin_c = _QC_C.get("mRNA-seq", {}).get("RIN", {})
+        _rp = _rin_c.get("pass", 7.0)
+        _rw = _rin_c.get("warning", 5.0)
+        _bar_chart(ax_rin, sample_ids, rins, rin_st,
+                   "GQN / RIN", "GQN / RIN", fmt="{:.1f}",
+                   thresholds=[
+                       (_rp, _STATUS_MPL["Pass"],    f"Pass ≥{_rp}"),
+                       (_rw, _STATUS_MPL["Warning"], f"Warning ≥{_rw}"),
+                   ])
     else:
-        ax_bar.text(0.5, 0.5, "No concentration data",
-                    ha="center", va="center",
-                    transform=ax_bar.transAxes, color="#9E9E9E")
-        ax_bar.axis("off")
+        ax_rin.text(0.5, 0.5, "No GQN/RIN data", ha="center", va="center",
+                    transform=ax_rin.transAxes, color="#9E9E9E", fontsize=8)
+        ax_rin.axis("off")
 
-    fig.text(0.5, 0.010, f"NGS Sample QC LIMS  |  {datetime.now().strftime('%Y-%m-%d')}",
+    # ── Chart 3: Concentration ───────────────────────────────────────
+    ax_conc = fig.add_subplot(gs[4])
+    if any(v is not None for v in concs):
+        _bar_chart(ax_conc, sample_ids, concs, conc_st,
+                   "Concentration (ng/µl)", "Concentration (ng/µl)  [Qubit > NanoDrop > FemtoPulse]",
+                   fmt="{:.2f}")
+    else:
+        ax_conc.text(0.5, 0.5, "No concentration data", ha="center", va="center",
+                     transform=ax_conc.transAxes, color="#9E9E9E", fontsize=8)
+        ax_conc.axis("off")
+
+    fig.text(0.5, 0.008, f"NGS Sample QC LIMS  |  {datetime.now().strftime('%Y-%m-%d')}",
              ha="center", fontsize=7, color="#888888")
     return fig
+
+
+def _apply_table_style(tbl, n_cols: int, n_data_rows: int,
+                       status_col: int = -1, metrics_dicts_ref: list = None,
+                       font_size: float = 7.0,
+                       hdr_color: str = "#2C3E6B",
+                       alt_color: str = "#F4F6FB",
+                       edge_color: str = "#D5D9E0"):
+    """Clean, minimal table style: compact header, light alternating rows, thin borders."""
+    ROW_H = 0.048   # data row height (axes fraction units — overridden by bbox)
+
+    for col in range(n_cols):
+        cell = tbl[0, col]
+        cell.set_facecolor(hdr_color)
+        cell.set_text_props(color="white", fontweight="bold", fontsize=font_size)
+        cell.set_edgecolor(edge_color)
+        cell.set_linewidth(0.4)
+
+    for r in range(n_data_rows):
+        row_bg = alt_color if r % 2 == 1 else "white"
+        for col in range(n_cols):
+            if (r + 1, col) not in tbl._cells:
+                continue
+            cell = tbl[r + 1, col]
+            cell.set_facecolor(row_bg)
+            cell.set_edgecolor(edge_color)
+            cell.set_linewidth(0.4)
+            cell.set_text_props(fontsize=font_size)
+
+    # Status column: light tinted background + bold colored text
+    if status_col >= 0 and metrics_dicts_ref is not None:
+        _tint = {"Pass": "#E8F5E9", "Warning": "#FFF8E1", "Fail": "#FFEBEE"}
+        _text = {"Pass": "#2E7D32", "Warning": "#E65100", "Fail": "#C62828"}
+        for r, m in enumerate(metrics_dicts_ref):
+            st = m.get("status", "") if isinstance(m, dict) else ""
+            if st in _tint and (r + 1, status_col) in tbl._cells:
+                tbl[r + 1, status_col].set_facecolor(_tint[st])
+                tbl[r + 1, status_col].set_text_props(
+                    color=_text[st], fontweight="bold", fontsize=font_size)
 
 
 def _build_sample_combined_page(
@@ -809,10 +1104,20 @@ def _build_sample_combined_page(
     metrics_dicts: list,
     session,
 ) -> "plt.Figure":
-    """샘플 1개: QC table (상단) + Electropherogram + Smear (하단). Portrait A4."""
+    """샘플 1개: QC Metrics 표 + Electropherogram + Smear Analysis 표. Portrait A4.
+
+    Layout (y=0 bottom, y=1 top, A4 11.69 inch):
+      header        0.950 ~ 0.982
+      divider       0.944
+      QC Metrics    label y=0.940 / table [0.048, 0.710, 0.904, 0.226]
+      criteria note y=0.703 (va=top)
+      divider       0.692
+      Electropherogram label y=0.687 / axes [0.048, 0.352, 0.904, 0.330]
+      Smear Analysis label y=0.344 / axes [0.048, 0.038, 0.904, 0.300]
+      footer        y=0.016
+    """
     import io
 
-    # Electropherogram 로드 시도
     traces, calibration = [], None
     try:
         from analysis.visualizer import load_electropherogram_traces, qc_visualizer
@@ -821,7 +1126,6 @@ def _build_sample_combined_page(
         logger.warning(f"Electropherogram load failed for {sid}: {e}")
     has_electro = bool(traces)
 
-    # Smear analysis
     smears = []
     try:
         smears = get_smear_analyses_by_sample(session, sid)
@@ -835,8 +1139,8 @@ def _build_sample_combined_page(
     fig = plt.figure(figsize=(8.27, 11.69))
     fig.patch.set_facecolor("white")
 
-    # ── 헤더 (fig 좌표계) ────────────────────────────────────────────
-    fig.text(0.048, 0.966,
+    # ── 헤더 ──────────────────────────────────────────────────────────
+    fig.text(0.048, 0.977,
              f"{snap.get('sample_id', '')}  —  {snap.get('sample_name', '')}",
              fontsize=12, fontweight="bold", color="#1A237E", va="top")
     info_line = (
@@ -844,161 +1148,146 @@ def _build_sample_combined_page(
         f"Species: {snap.get('species', '-')}  |  "
         f"Material: {snap.get('material', '-')}"
     )
-    desc = (snap.get("description") or "")[:70]
+    desc = (snap.get("description") or "")[:80]
     if desc:
         info_line += f"  |  {desc}"
-    fig.text(0.048, 0.946, info_line, fontsize=7.5, color="#333333", va="top")
+    fig.text(0.048, 0.957, info_line, fontsize=7.5, color="#444444", va="top")
     if status:
-        fig.text(0.952, 0.966, status,
+        fig.text(0.952, 0.977, status,
                  fontsize=11, fontweight="bold", ha="right", va="top", color="white",
                  bbox=dict(facecolor=status_color, edgecolor="none",
                            boxstyle="round,pad=0.3"))
 
-    # ── 레이아웃 좌표 결정 ────────────────────────────────────────────
-    content_top = 0.922   # 헤더 2줄 아래 (10mm 상단 마진 반영)
-    content_bot = 0.048   # 10mm 하단 마진
+    # 헤더 구분선
+    from matplotlib.lines import Line2D
+    def _hline(y, color="#CCCCCC", lw=0.8, ls="-"):
+        fig.add_artist(Line2D([0.048, 0.952], [y, y],
+                              transform=fig.transFigure,
+                              color=color, linewidth=lw, linestyle=ls))
+    _hline(0.947)
 
-    gap       = 0.012
-    smear_h   = 0.13 if (has_electro and has_smear) else 0.0
-    electro_h = 0.34 if has_electro else 0.0
+    # ── QC Metrics 표 ─────────────────────────────────────────────────
+    fig.text(0.048, 0.943, "QC Metrics",
+             fontsize=9, fontweight="bold", color="#1A237E", va="top")
 
-    # 하단에서 올라오는 고정 영역 합계
-    bottom_used = content_bot
-    if has_electro:
-        bottom_used += electro_h + gap
-        if has_smear:
-            bottom_used += smear_h + gap
-
-    # QC 표는 내용에 맞는 자연스러운 높이로 (A4 세로 비율)
-    n_data_rows = len(metrics_dicts) if metrics_dicts else 1
-    _row_h = 0.030   # 데이터 행 1줄 높이 (figure fraction)
-    _hdr_h = _row_h * 2.4   # 2줄 헤더
-    _title_h = 0.028
-    natural_tbl_h = _title_h + _hdr_h + n_data_rows * _row_h + 0.010
-    tbl_h_actual = min(natural_tbl_h, content_top - bottom_used - 0.02)
-    tbl_h_actual = max(tbl_h_actual, 0.08)
-
-    # ── QC Metrics Table (위에서 아래로 배치) ─────────────────────────
-    ax_tbl = fig.add_axes([0.048, content_top - tbl_h_actual, 0.904, tbl_h_actual])
+    QC_BOT = 0.710
+    QC_H   = 0.228   # top ≈ 0.938
+    ax_tbl = fig.add_axes([0.048, QC_BOT, 0.904, QC_H])
     ax_tbl.axis("off")
-    ax_tbl.set_title("QC Metrics", fontsize=9, fontweight="bold",
-                     loc="left", pad=4, color="#1A237E")
 
     tbl_col_labels = ["Step", "Instrument", "Conc\n(ng/µl)", "Vol\n(µl)",
-                      "Total\n(ng)", "GQN/\nRIN", "Avg\nSize(bp)", "Status", "Date"]
+                      "Total\n(ng)", "GQN/\nRIN", "Avg Size\n(bp)",
+                      "%CV", "MQI", "Status", "Date"]
+
+    smear_by_step: dict = {}
+    for sa in smears:
+        smear_by_step.setdefault(sa.step, {})[sa.range_text or ''] = sa
 
     if metrics_dicts:
+        is_rna = 'rna' in (snap.get("sample_type") or '').lower()
         rows = []
         for m in metrics_dicts:
             date_str = m["measured_at"].strftime("%Y-%m-%d") if m["measured_at"] else "-"
+            step_sm = smear_by_step.get(m["step"], {})
+            cv_str = (
+                _widest_cv(step_sm)
+                if m.get("instrument") == "Femto Pulse" and is_rna else "-"
+            )
+            mqi_str = (
+                _compute_mqi(step_sm)
+                if m.get("instrument") == "Femto Pulse" and is_rna else "-"
+            )
             rows.append([
-                m["step"] or "-",
-                m["instrument"] or "-",
-                _fmt(m["concentration"]),
-                _fmt(m["volume"]),
-                _fmt(m["total_amount"]),
-                _fmt(m["gqn_rin"]),
-                _fmt(m["avg_size"], 0),
-                m["status"] or "-",
-                date_str,
+                m["step"] or "-", m["instrument"] or "-",
+                _fmt(m["concentration"]), _fmt(m["volume"]),
+                _fmt(m["total_amount"]), _fmt(m["gqn_rin"]),
+                _fmt(m["avg_size"], 0), cv_str, mqi_str,
+                m["status"] or "-", date_str,
             ])
     else:
         rows = [["No data"] + ["-"] * (len(tbl_col_labels) - 1)]
 
     tbl = ax_tbl.table(
-        cellText=rows,
-        colLabels=tbl_col_labels,
-        loc="upper center",
-        cellLoc="center",
+        cellText=rows, colLabels=tbl_col_labels,
+        loc="upper center", cellLoc="center",
         bbox=[0.0, 0.0, 1.0, 1.0],
     )
     tbl.auto_set_font_size(False)
-    tbl.set_fontsize(8)
+    tbl.set_fontsize(7)
     tbl.auto_set_column_width(list(range(len(tbl_col_labels))))
+    _apply_table_style(
+        tbl, len(tbl_col_labels), len(rows),
+        status_col=tbl_col_labels.index("Status"),
+        metrics_dicts_ref=metrics_dicts if metrics_dicts else [],
+    )
 
-    for col in range(len(tbl_col_labels)):
-        cell = tbl[0, col]
-        cell.set_facecolor("#1A237E")
-        cell.set_text_props(color="white", fontweight="bold", fontsize=8)
-        cell.set_height(cell.get_height() * 2.0)
+    # ── 판정 기준 주석 ─────────────────────────────────────────────────
+    criteria_text = _criteria_note(snap.get("sample_type", ""))
+    if criteria_text:
+        fig.text(0.048, QC_BOT - 0.007, criteria_text,
+                 fontsize=6.0, color="#777777", va="top", style="italic")
 
-    status_col = tbl_col_labels.index("Status")
-    for row_idx, m in enumerate(metrics_dicts if metrics_dicts else []):
-        st = m.get("status", "")
-        color = _STATUS_MPL.get(st)
-        if color:
-            tbl[row_idx + 1, status_col].set_facecolor(color)
-            tbl[row_idx + 1, status_col].set_text_props(
-                color="white", fontweight="bold"
-            )
-        if row_idx % 2 == 1:
-            for col in range(len(tbl_col_labels)):
-                if (row_idx + 1, col) in tbl._cells:
-                    cell = tbl[row_idx + 1, col]
-                    if cell.get_facecolor()[:3] == (1, 1, 1):
-                        cell.set_facecolor("#F3F4F6")
-
-    # ── Electropherogram (하단에서 위로 배치) ─────────────────────────
+    # ── 전기영동 섹션 ─────────────────────────────────────────────────
     if has_electro:
-        electro_bot = content_bot + (smear_h + gap if has_smear else 0)
+        _hline(0.692, color="#CCCCCC", lw=0.8, ls="--")
+        fig.text(0.048, 0.688, "Electropherogram",
+                 fontsize=9, fontweight="bold", color="#1A237E", va="top")
+
+        EP_BOT = 0.352
+        EP_H   = 0.330   # top ≈ 0.682
         try:
             ephero_fig, _, _, _, _ = qc_visualizer.plot_electropherogram_overlay(
                 sid, traces, calibration
             )
             if ephero_fig is not None:
                 buf = io.BytesIO()
-                ephero_fig.savefig(buf, format="png", dpi=130,
+                ephero_fig.savefig(buf, format="png", dpi=140,
                                    bbox_inches="tight", facecolor="white")
                 plt.close(ephero_fig)
                 buf.seek(0)
                 img = plt.imread(buf)
-
-                ax_ep = fig.add_axes([0.048, electro_bot, 0.904, electro_h])
+                ax_ep = fig.add_axes([0.048, EP_BOT, 0.904, EP_H])
                 ax_ep.imshow(img, aspect="auto")
                 ax_ep.axis("off")
-                ax_ep.set_title("Electropherogram", fontsize=9, fontweight="bold",
-                                loc="left", color="#1A237E", pad=3)
         except Exception as e:
             logger.error(f"Electropherogram embed failed for {sid}: {e}")
 
-    # ── Smear Analysis ───────────────────────────────────────────────
-    if has_smear and has_electro:
+    # ── Smear Analysis ─────────────────────────────────────────────────
+    if has_smear:
+        SM_LABEL_Y = 0.344 if has_electro else (QC_BOT - 0.040)
+        SM_BOT     = 0.038
+        SM_H       = SM_LABEL_Y - 0.008 - SM_BOT
+
+        _hline(SM_LABEL_Y + 0.004, color="#CCCCCC", lw=0.8, ls="--")
+        fig.text(0.048, SM_LABEL_Y, "Smear Analysis",
+                 fontsize=9, fontweight="bold", color="#1A237E", va="top")
+
+        smear_cols = ["Step", "Range", "% Total", "Avg Size (bp)", "%CV", "DQN"]
         smear_data = [
             [
                 s.step or "-",
                 s.range_text or "-",
                 f"{s.pct_total:.1f}" if s.pct_total is not None else "-",
                 f"{s.avg_size:.0f}" if s.avg_size is not None else "-",
+                f"{s.cv:.1f}" if s.cv is not None else "-",
                 f"{s.dqn:.2f}" if s.dqn is not None else "-",
             ]
             for s in smears
         ]
-        ax_sm = fig.add_axes([0.048, content_bot, 0.904, smear_h])
+        ax_sm = fig.add_axes([0.048, SM_BOT, 0.904, SM_H])
         ax_sm.axis("off")
-        ax_sm.set_title("Smear Analysis", fontsize=8, fontweight="bold",
-                        loc="left", color="#1A237E", pad=3)
         sm_tbl = ax_sm.table(
             cellText=smear_data,
-            colLabels=["Step", "Range", "% Total", "Avg Size (bp)", "DQN"],
-            loc="upper center",
-            cellLoc="center",
+            colLabels=smear_cols,
+            loc="upper center", cellLoc="center",
             bbox=[0.0, 0.0, 1.0, 1.0],
         )
         sm_tbl.auto_set_font_size(False)
         sm_tbl.set_fontsize(7)
-        sm_tbl.auto_set_column_width([0, 1, 2, 3, 4])
-        for col in range(5):
-            sm_tbl[0, col].set_facecolor("#1A237E")
-            sm_tbl[0, col].set_text_props(
-                color="white", fontweight="bold", fontsize=7
-            )
-            sm_tbl[0, col].set_height(sm_tbl[0, col].get_height() * 1.8)
-        for r in range(len(smear_data)):
-            if r % 2 == 1:
-                for col in range(5):
-                    sm_tbl[r + 1, col].set_facecolor("#F3F4F6")
+        sm_tbl.auto_set_column_width(list(range(len(smear_cols))))
+        _apply_table_style(sm_tbl, len(smear_cols), len(smear_data))
 
-    fig.text(0.5, 0.014,
+    fig.text(0.5, 0.016,
              f"NGS Sample QC LIMS  |  {datetime.now().strftime('%Y-%m-%d')}",
              ha="center", fontsize=7, color="#888888")
     return fig
@@ -1214,7 +1503,7 @@ def _build_report_figure(snap: dict, metrics: list) -> "plt.Figure":
     gs = gridspec.GridSpec(
         4, 1, figure=fig,
         height_ratios=[1.2, 3, 2.8, 0.2],
-        hspace=0.55,
+        hspace=0.70,
         left=0.08, right=0.95, top=0.94, bottom=0.04,
     )
 
@@ -1257,14 +1546,19 @@ def _build_report_figure(snap: dict, metrics: list) -> "plt.Figure":
     ax_charts.axis("off")
 
     inner_gs = gridspec.GridSpecFromSubplotSpec(
-        1, 3, subplot_spec=gs[1], wspace=0.45
+        1, 3, subplot_spec=gs[1], wspace=0.52
     )
     ax_conc = fig.add_subplot(inner_gs[0])
     ax_gqn  = fig.add_subplot(inner_gs[1])
     ax_size = fig.add_subplot(inner_gs[2])
 
     if metrics:
-        steps      = [m["step"] or "?" for m in metrics]
+        # Two-line x-tick labels: step name + instrument abbreviation
+        steps = [
+            f"{(m['step'] or '?')}\n({_short_instrument(m.get('instrument', ''))})"
+            if m.get('instrument') else (m['step'] or '?')
+            for m in metrics
+        ]
         concs      = [m["concentration"] or 0 for m in metrics]
         gqns       = [m["gqn_rin"] or 0 for m in metrics]
         sizes      = [m["avg_size"] or 0 for m in metrics]
@@ -1279,11 +1573,15 @@ def _build_report_figure(snap: dict, metrics: list) -> "plt.Figure":
         ]:
             bars = ax.bar(x, vals, color=bar_colors, edgecolor="white", linewidth=0.6)
             ax.set_xticks(x)
-            ax.set_xticklabels(steps, rotation=30, ha="right", fontsize=6.5)
+            ax.set_xticklabels(steps, rotation=35, ha="right", fontsize=6,
+                               linespacing=1.2)
             ax.set_ylabel(ylabel, fontsize=7)
             ax.tick_params(axis="y", labelsize=7)
             ax.spines[["top", "right"]].set_visible(False)
             ax.set_facecolor("#FAFAFA")
+            # 25% headroom so value annotations don't overflow into chart title
+            max_v = max((v for v in vals if v), default=0)
+            ax.set_ylim(0, max_v * 1.28 if max_v > 0 else 1)
             for bar, val in zip(bars, vals):
                 if val > 0:
                     ax.text(bar.get_x() + bar.get_width() / 2,

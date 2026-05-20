@@ -9,9 +9,9 @@ from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLineEdit, QComboBox, QLabel, QPushButton, QDialogButtonBox,
     QFileDialog, QTableWidget, QTableWidgetItem, QMessageBox,
-    QHeaderView, QDoubleSpinBox, QTextEdit, QAbstractItemView,
+    QHeaderView, QSpinBox, QDoubleSpinBox, QTextEdit, QAbstractItemView,
     QDateEdit, QListWidget, QListWidgetItem, QSplitter,
-    QInputDialog, QCompleter, QSizePolicy, QWidget,
+    QInputDialog, QCompleter, QSizePolicy, QWidget, QGroupBox,
 )
 from PyQt5.QtCore import Qt, QDate
 from PyQt5.QtGui import QFont
@@ -39,6 +39,16 @@ from parsers import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _range_span(range_text: str) -> float:
+    """Parse two numbers from a smear range_text and return (end - start).
+    Returns 0.0 on failure — used to identify the widest (= total) range.
+    """
+    import re
+    nums = [float(n) for n in re.findall(r'\d+(?:\.\d+)?',
+                                          str(range_text).replace(',', ''))]
+    return (nums[1] - nums[0]) if len(nums) >= 2 else 0.0
 
 
 class ProjectDialog(QDialog):
@@ -472,6 +482,290 @@ class SampleDialog(QDialog):
             QMessageBox.critical(self, "Error", f"Failed to save sample:\n{e}")
 
 
+class BatchSampleDialog(QDialog):
+    """배치 샘플 등록 다이얼로그.
+
+    ID prefix + 시작 번호 + 개수를 지정하면 N개 샘플을 한 번에 등록한다.
+    샘플명은 name prefix + 번호(2자리) 또는 커스텀 접미사 선택.
+    공통 메타데이터(Project, Species, Material, Type)는 한 번만 입력.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Batch Sample Registration")
+        self.setMinimumWidth(580)
+        self.setMinimumHeight(520)
+        self._project_map = {}
+        self._build_ui()
+
+    # ── UI 구성 ───────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setSpacing(10)
+
+        # ── ID / 이름 설정 ──────────────────────────────────────────
+        id_group = self._make_group("Sample ID")
+        id_form = QFormLayout(id_group)
+        id_form.setSpacing(6)
+
+        id_prefix_row = QHBoxLayout()
+        self._id_prefix = QLineEdit()
+        self._id_prefix.setPlaceholderText("예: PYM-V-")
+        self._id_prefix.textChanged.connect(self._refresh_preview)
+        id_prefix_row.addWidget(self._id_prefix)
+        id_prefix_row.addWidget(QLabel("Start:"))
+        self._id_start_spin = QSpinBox()
+        self._id_start_spin.setRange(1, 9999)
+        self._id_start_spin.setValue(1)
+        self._id_start_spin.setFixedWidth(70)
+        self._id_start_spin.valueChanged.connect(self._refresh_preview)
+        id_prefix_row.addWidget(self._id_start_spin)
+        id_prefix_row.addWidget(QLabel("Count:"))
+        self._count_spin = QSpinBox()
+        self._count_spin.setRange(1, 200)
+        self._count_spin.setValue(3)
+        self._count_spin.setFixedWidth(70)
+        self._count_spin.valueChanged.connect(self._refresh_preview)
+        id_prefix_row.addWidget(self._count_spin)
+        id_form.addRow("ID Prefix:", id_prefix_row)
+
+        # 번호 자릿수
+        pad_row = QHBoxLayout()
+        self._id_pad = QSpinBox()
+        self._id_pad.setRange(1, 4)
+        self._id_pad.setValue(1)
+        self._id_pad.setFixedWidth(55)
+        self._id_pad.valueChanged.connect(self._refresh_preview)
+        pad_row.addWidget(self._id_pad)
+        pad_row.addWidget(QLabel("자리  (1→1, 2→01, 3→001)"))
+        pad_row.addStretch()
+        id_form.addRow("번호 자릿수:", pad_row)
+
+        root.addWidget(id_group)
+
+        # ── 샘플명 설정 ─────────────────────────────────────────────
+        name_group = self._make_group("Sample Name")
+        name_form = QFormLayout(name_group)
+        name_form.setSpacing(6)
+
+        name_prefix_row = QHBoxLayout()
+        self._name_prefix = QLineEdit()
+        self._name_prefix.setPlaceholderText("예: Vehicle_  (비우면 ID를 이름으로 사용)")
+        self._name_prefix.textChanged.connect(self._refresh_preview)
+        name_prefix_row.addWidget(self._name_prefix)
+        name_form.addRow("Name Prefix:", name_prefix_row)
+
+        suffix_row = QHBoxLayout()
+        self._name_suffix_combo = QComboBox()
+        self._name_suffix_combo.addItems(["번호 없음 (prefix만)", "숫자  1, 2, 3 …", "2자리  01, 02, 03 …", "3자리  001, 002, 003 …"])
+        self._name_suffix_combo.setCurrentIndex(2)
+        self._name_suffix_combo.currentIndexChanged.connect(self._refresh_preview)
+        suffix_row.addWidget(self._name_suffix_combo)
+        suffix_row.addStretch()
+        name_form.addRow("번호 형식:", suffix_row)
+
+        root.addWidget(name_group)
+
+        # ── 공통 메타데이터 ─────────────────────────────────────────
+        meta_group = self._make_group("공통 메타데이터")
+        meta_form = QFormLayout(meta_group)
+        meta_form.setSpacing(6)
+
+        proj_row = QHBoxLayout()
+        self._project_combo = QComboBox()
+        self._project_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._project_combo.activated.connect(self._on_project_changed)
+        proj_row.addWidget(self._project_combo)
+        btn_new_proj = QPushButton("+")
+        btn_new_proj.setFixedWidth(28)
+        btn_new_proj.setToolTip("새 프로젝트 추가")
+        btn_new_proj.clicked.connect(self._add_new_project)
+        proj_row.addWidget(btn_new_proj)
+        meta_form.addRow("Project *:", proj_row)
+
+        self._species_combo = QComboBox()
+        self._species_combo.setEditable(True)
+        for sp in SPECIES_LIST:
+            self._species_combo.addItem(sp)
+        self._species_combo.setCurrentIndex(-1)
+        self._species_combo.setPlaceholderText("Select or type...")
+        meta_form.addRow("Species:", self._species_combo)
+
+        self._material_combo = QComboBox()
+        self._material_combo.setEditable(True)
+        for mt in MATERIAL_LIST:
+            self._material_combo.addItem(mt)
+        self._material_combo.setCurrentIndex(-1)
+        self._material_combo.setPlaceholderText("Select or type...")
+        meta_form.addRow("Material:", self._material_combo)
+
+        self._type_combo = QComboBox()
+        for key, desc in SAMPLE_TYPES.items():
+            self._type_combo.addItem(f"{key} ({desc})", key)
+        meta_form.addRow("Sample Type:", self._type_combo)
+
+        root.addWidget(meta_group)
+
+        # ── 미리보기 테이블 ─────────────────────────────────────────
+        preview_group = self._make_group("미리보기")
+        preview_layout = QVBoxLayout(preview_group)
+        preview_layout.setContentsMargins(6, 6, 6, 6)
+
+        self._preview_table = QTableWidget(0, 3)
+        self._preview_table.setHorizontalHeaderLabels(["#", "Sample ID", "Sample Name"])
+        self._preview_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self._preview_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
+        self._preview_table.setColumnWidth(0, 36)
+        self._preview_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._preview_table.setSelectionMode(QAbstractItemView.NoSelection)
+        self._preview_table.setAlternatingRowColors(True)
+        self._preview_table.setMaximumHeight(160)
+        preview_layout.addWidget(self._preview_table)
+
+        root.addWidget(preview_group)
+
+        # ── 버튼 ────────────────────────────────────────────────────
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.button(QDialogButtonBox.Ok).setText("Register All")
+        btns.accepted.connect(self._on_accept)
+        btns.rejected.connect(self.reject)
+        root.addWidget(btns)
+
+        self._load_projects()
+        self._refresh_preview()
+
+    @staticmethod
+    def _make_group(title: str) -> QGroupBox:
+        return QGroupBox(title)
+
+    # ── 데이터 로드 ───────────────────────────────────────────────────
+
+    def _load_projects(self):
+        self._project_map = {}
+        try:
+            with db_manager.session_scope() as session:
+                projects = get_all_projects(session)
+                proj_data = [
+                    {"project_name": p.project_name, "species": p.species,
+                     "material": p.material, "sample_type": p.sample_type}
+                    for p in projects
+                ]
+        except Exception:
+            proj_data = []
+        self._project_combo.clear()
+        self._project_combo.addItem("")
+        for d in proj_data:
+            self._project_combo.addItem(d["project_name"])
+            self._project_map[d["project_name"]] = d
+
+    def _add_new_project(self):
+        dlg = ProjectDialog(parent=self)
+        if dlg.exec_() == QDialog.Accepted:
+            self._load_projects()
+            self._project_combo.setCurrentText(dlg.saved_name)
+            self._on_project_changed(self._project_combo.currentIndex())
+
+    def _on_project_changed(self, index: int):
+        name = self._project_combo.currentText()
+        proj = self._project_map.get(name)
+        if not proj:
+            return
+        if proj.get("species"):
+            self._species_combo.setCurrentText(proj["species"])
+        if proj.get("material"):
+            self._material_combo.setCurrentText(proj["material"])
+        if proj.get("sample_type"):
+            idx = self._type_combo.findData(proj["sample_type"])
+            if idx >= 0:
+                self._type_combo.setCurrentIndex(idx)
+
+    # ── 미리보기 생성 ─────────────────────────────────────────────────
+
+    def _make_id(self, n: int) -> str:
+        prefix = self._id_prefix.text()
+        pad = self._id_pad.value()
+        return f"{prefix}{str(n).zfill(pad)}"
+
+    def _make_name(self, n: int) -> str:
+        prefix = self._name_prefix.text().strip()
+        idx = self._name_suffix_combo.currentIndex()
+        if idx == 0:
+            return prefix if prefix else self._make_id(n)
+        elif idx == 1:
+            return f"{prefix}{n}" if prefix else str(n)
+        elif idx == 2:
+            return f"{prefix}{str(n).zfill(2)}" if prefix else str(n).zfill(2)
+        else:
+            return f"{prefix}{str(n).zfill(3)}" if prefix else str(n).zfill(3)
+
+    def _refresh_preview(self):
+        start = self._id_start_spin.value()
+        count = self._count_spin.value()
+        self._preview_table.setRowCount(count)
+        for i, n in enumerate(range(start, start + count)):
+            num_item = QTableWidgetItem(str(i + 1))
+            num_item.setTextAlignment(Qt.AlignCenter)
+            self._preview_table.setItem(i, 0, num_item)
+            self._preview_table.setItem(i, 1, QTableWidgetItem(self._make_id(n)))
+            self._preview_table.setItem(i, 2, QTableWidgetItem(self._make_name(n)))
+
+    # ── 저장 ─────────────────────────────────────────────────────────
+
+    def _on_accept(self):
+        project = self._project_combo.currentText().strip()
+        if not project:
+            QMessageBox.warning(self, "Validation", "Project를 선택해주세요.")
+            return
+
+        start = self._id_start_spin.value()
+        count = self._count_spin.value()
+        samples_to_add = [
+            {"sample_id": self._make_id(n), "sample_name": self._make_name(n)}
+            for n in range(start, start + count)
+        ]
+
+        species = self._species_combo.currentText().strip() or None
+        material = self._material_combo.currentText().strip() or None
+        sample_type = self._type_combo.currentData()
+
+        try:
+            with db_manager.session_scope() as session:
+                # 중복 ID 사전 체크
+                duplicates = [
+                    s["sample_id"] for s in samples_to_add
+                    if get_sample_by_id(session, s["sample_id"])
+                ]
+                if duplicates:
+                    QMessageBox.warning(
+                        self, "Duplicate IDs",
+                        f"이미 존재하는 Sample ID:\n{', '.join(duplicates)}\n\n"
+                        "Prefix 또는 시작 번호를 변경해주세요."
+                    )
+                    return
+
+                for s in samples_to_add:
+                    add_sample(session, {
+                        "sample_id": s["sample_id"],
+                        "sample_name": s["sample_name"] or None,
+                        "project": project,
+                        "species": species,
+                        "material": material,
+                        "sample_type": sample_type,
+                    })
+
+            QMessageBox.information(
+                self, "완료",
+                f"{count}개 샘플이 등록되었습니다.\n"
+                f"({self._make_id(start)} – {self._make_id(start + count - 1)})"
+            )
+            self.accept()
+
+        except Exception as e:
+            logger.error(f"Batch registration failed: {e}")
+            QMessageBox.critical(self, "Error", f"등록 중 오류 발생:\n{e}")
+
+
 class NanoDropDialog(QDialog):
     """NanoDrop 측정값 입력/수정 다이얼로그
 
@@ -749,6 +1043,17 @@ class QubitDialog(QDialog):
             return
 
         prev_step = self._steps[step_idx - 1]
+
+        def _rank(m):
+            if not m.instrument:
+                return 99
+            i = m.instrument.lower()
+            if "qubit" in i:
+                return 0
+            if "nanodrop" in i or "nano" in i:
+                return 1
+            return 2
+
         try:
             with db_manager.session_scope() as session:
                 prev_metrics = [
@@ -756,11 +1061,12 @@ class QubitDialog(QDialog):
                     if m.step == prev_step and m.total_amount is not None
                 ]
                 if prev_metrics:
-                    prev_total = prev_metrics[-1].total_amount
+                    best = min(prev_metrics, key=_rank)   # Qubit > NanoDrop 우선
+                    prev_total = best.total_amount
                     if prev_total and prev_total > 0:
                         recovery = (total / prev_total) * 100
                         self.recovery_label.setText(
-                            f"{recovery:.1f}%  ({prev_step} -> {step})"
+                            f"{recovery:.1f}%  ({prev_step} → {step})"
                         )
                         return
         except Exception:
@@ -839,6 +1145,7 @@ class FemtoPulseDialog(QDialog):
         self._quality_rows = []      # parsed quality table rows
         self._folder_data = None     # full parse result
         self._db_sample_ids = []     # [(sample_id, sample_name), ...]
+        self._smear_only_mode = False  # True when only smear analysis is available
         self._load_db_samples()
         self._build_ui()
 
@@ -999,6 +1306,7 @@ class FemtoPulseDialog(QDialog):
                 self.file_table.setItem(row, 1, item)
 
         # Parse quality table for preview
+        self._smear_only_mode = False
         qt_path = self._file_map.get('quality_table')
         if qt_path:
             try:
@@ -1010,8 +1318,30 @@ class FemtoPulseDialog(QDialog):
         else:
             self._quality_rows = []
 
+        # Smear-only fallback: no quality table but smear analysis exists
+        if not self._quality_rows:
+            sa_path = self._file_map.get('smear_analysis')
+            if sa_path:
+                try:
+                    sa_rows = parse_smear_analysis(sa_path)
+                    seen: dict = {}
+                    for sr in sa_rows:
+                        fsid = sr.get('sample_id', '')
+                        if fsid and fsid not in seen:
+                            seen[fsid] = {
+                                'sample_id': fsid,
+                                'well': sr.get('well', ''),
+                                'dqn': None,
+                                'total_concentration': None,
+                            }
+                    self._quality_rows = list(seen.values())
+                    if self._quality_rows:
+                        self._smear_only_mode = True
+                except Exception as e:
+                    logger.warning(f"Smear-only fallback parse failed: {e}")
+
         self._populate_preview()
-        # Enable OK when quality table is loaded; actual import requires at least one DB Sample ID
+        # Enable OK when quality table or smear analysis is loaded
         self.ok_button.setEnabled(len(self._quality_rows) > 0)
 
     def _populate_preview(self):
@@ -1139,9 +1469,32 @@ class FemtoPulseDialog(QDialog):
                     except Exception as e:
                         logger.warning(f"Smear analysis pre-parse failed: {e}")
 
-                # 2. Save QCMetric + RawTrace per sample
+                # Pre-parse electropherogram for peak_size per sample
+                peak_by_file_sid = {}  # file_sid / col_name fragment -> peak_size_bp
+                local_electro_pre = local_file_map.get('electropherogram')
+                if local_electro_pre:
+                    try:
+                        import numpy as np
+                        from parsers.femtopulse_parser import parse_electropherogram as _parse_ep
+                        ep_data = _parse_ep(local_electro_pre)
+                        size_bp_arr = ep_data['size_bp']
+                        for col_name, rfu_arr in ep_data['samples'].items():
+                            valid = (
+                                np.isfinite(rfu_arr)
+                                & np.isfinite(size_bp_arr)
+                                & (size_bp_arr >= 200)
+                                & (size_bp_arr <= 165000)
+                            )
+                            if valid.any():
+                                masked = np.where(valid, rfu_arr, np.nan)
+                                peak_idx = int(np.nanargmax(masked))
+                                peak_by_file_sid[col_name] = float(size_bp_arr[peak_idx])
+                    except Exception as ep_err:
+                        logger.warning(f"Electropherogram peak_size pre-parse failed: {ep_err}")
+
+                # 2. Save QCMetric + RawTrace per sample (skip in smear-only mode)
                 electro_path = self._file_map.get('electropherogram')
-                for row, r in enumerate(self._quality_rows):
+                for row, r in enumerate([] if self._smear_only_mode else self._quality_rows):
                     file_sid = r.get('sample_id', '')
                     db_sid = sid_map.get(file_sid, '')
                     if not db_sid:
@@ -1152,13 +1505,76 @@ class FemtoPulseDialog(QDialog):
                         skipped.append(db_sid)
                         continue
 
-                    # Lookup avg_size from smear "10000 bp to 165000 bp" range
+                    # Lookup avg_size from smear analysis
+                    # DNA : "10000 – 165000 bp" 범위 고정
+                    # RNA : 가장 넓은 span = 전체 범위 (200 – 6000 nt 등 사용자 설정)
                     smear_ranges = smear_by_file_sid.get(file_sid, {})
                     avg_size = None
-                    for rng_key, sr_data in smear_ranges.items():
-                        if '10000' in rng_key and '165' in rng_key:
-                            avg_size = sr_data.get('avg_size')
-                            break
+                    is_rna = (sample.sample_type or '').lower().find('rna') >= 0
+                    if is_rna and smear_ranges:
+                        widest_key = max(smear_ranges, key=_range_span, default=None)
+                        if widest_key:
+                            avg_size = smear_ranges[widest_key].get('avg_size')
+                    else:
+                        for rng_key, sr_data in smear_ranges.items():
+                            if '10000' in rng_key and '165' in rng_key:
+                                avg_size = sr_data.get('avg_size')
+                                break
+
+                    # peak_size: DNA는 electropherogram argmax, RNA는 smear avg_size로
+                    # 대체하므로 저장하지 않음 (avg_size가 authoritative)
+                    peak_sz = None
+                    if not is_rna:
+                        for col_name, sz in peak_by_file_sid.items():
+                            if file_sid and file_sid in col_name:
+                                peak_sz = sz
+                                break
+
+                    # MQI and %CV from smear ranges (RNA + Femto Pulse only)
+                    mqi_val = None
+                    cv_total_val = None
+                    if is_rna and smear_ranges:
+                        import re as _re
+                        widest_key = max(smear_ranges, key=_range_span, default=None)
+                        # %CV from the widest (Total) range
+                        if widest_key:
+                            cv_raw = smear_ranges[widest_key].get('cv')
+                            try:
+                                cv_total_val = float(cv_raw) if cv_raw not in (None, 'NaN', '') else None
+                            except (TypeError, ValueError):
+                                cv_total_val = None
+                        # MQI = High% / (Low% + High%), sub-ranges only
+                        pct_low_sum = 0.0
+                        pct_high_sum = 0.0
+                        has_sub = False
+                        for rng_text, sr_data in smear_ranges.items():
+                            if rng_text == widest_key:
+                                continue
+                            pct = sr_data.get('pct_total')
+                            try:
+                                pct = float(pct) if pct not in (None, 'NaN', '') else None
+                            except (TypeError, ValueError):
+                                pct = None
+                            if pct is None:
+                                continue
+                            if _re.search(r'marker|ladder', str(rng_text), _re.IGNORECASE):
+                                continue
+                            nums = [float(n) for n in _re.findall(r'\d+(?:\.\d+)?',
+                                                                    str(rng_text).replace(',', ''))]
+                            if not nums:
+                                continue
+                            start = nums[0]
+                            end = nums[1] if len(nums) >= 2 else start * 5
+                            mid = (start + end) / 2
+                            has_sub = True
+                            if mid < 1000:
+                                pct_low_sum += pct
+                            else:
+                                pct_high_sum += pct
+                        if has_sub:
+                            denom = pct_low_sum + pct_high_sum
+                            if denom > 0:
+                                mqi_val = pct_high_sum / denom
 
                     conc_pg_ul = r.get('total_concentration')
                     conc_ng_ul = conc_pg_ul / 1000.0 if conc_pg_ul is not None else None
@@ -1167,6 +1583,8 @@ class FemtoPulseDialog(QDialog):
                         'gqn_rin': r.get('dqn'),
                         'avg_size': avg_size,
                         'step': step,
+                        'mqi': mqi_val,
+                        'cv_total': cv_total_val,
                     }
                     fp_qc_data['status'] = qc_judge.judge_qc(
                         sample.sample_type, fp_qc_data
@@ -1177,6 +1595,7 @@ class FemtoPulseDialog(QDialog):
                         'concentration': fp_qc_data['concentration'],
                         'gqn_rin': fp_qc_data['gqn_rin'],
                         'avg_size': fp_qc_data['avg_size'],
+                        'peak_size': peak_sz,
                         'status': fp_qc_data['status'],
                         'instrument': 'Femto Pulse',
                         'data_file': local_file_map.get('quality_table'),
@@ -1220,12 +1639,58 @@ class FemtoPulseDialog(QDialog):
                                 'dqn': sr.get('dqn'),
                             })
                             smear_saved += 1
+
+                        # Smear-only mode: update existing QCMetric.avg_size
+                        if self._smear_only_mode and smear_by_file_sid:
+                            from database.models import QCMetric as _QCMetric
+                            avg_updated = 0
+                            for f_sid, db_id in sid_map.items():
+                                smear_ranges = smear_by_file_sid.get(f_sid, {})
+                                if not smear_ranges:
+                                    continue
+                                s_obj = get_sample_by_id(session, db_id)
+                                if not s_obj:
+                                    continue
+                                is_rna_s = 'rna' in (s_obj.sample_type or '').lower()
+                                avg_val = None
+                                if is_rna_s:
+                                    widest = max(smear_ranges, key=_range_span, default=None)
+                                    if widest:
+                                        avg_val = smear_ranges[widest].get('avg_size')
+                                else:
+                                    for rk, sd in smear_ranges.items():
+                                        if '10000' in rk and '165' in rk:
+                                            avg_val = sd.get('avg_size')
+                                            break
+                                if avg_val is None:
+                                    continue
+                                # Update most recent Femto Pulse QCMetric for sample+step
+                                existing_m = (
+                                    session.query(_QCMetric)
+                                    .filter(
+                                        _QCMetric.sample_id == db_id,
+                                        _QCMetric.step == step,
+                                        _QCMetric.instrument == 'Femto Pulse',
+                                        _QCMetric.avg_size.is_(None),
+                                    )
+                                    .order_by(_QCMetric.measured_at.desc())
+                                    .all()
+                                )
+                                for m_rec in existing_m:
+                                    m_rec.avg_size = avg_val
+                                    avg_updated += 1
+                            if avg_updated:
+                                logger.info(f"Smear-only: updated avg_size for {avg_updated} QCMetric(s)")
+
                     except Exception as e:
                         logger.warning(f"Smear analysis save failed: {e}")
 
-            msg = f"Saved {saved} QC record(s)."
-            if smear_saved:
-                msg += f"\nSmear Analysis: {smear_saved} record(s)."
+            if self._smear_only_mode:
+                msg = f"Smear Analysis only import: {smear_saved} record(s) saved."
+            else:
+                msg = f"Saved {saved} QC record(s)."
+                if smear_saved:
+                    msg += f"\nSmear Analysis: {smear_saved} record(s)."
             if skipped:
                 msg += f"\nSkipped (not in DB): {', '.join(skipped)}"
             QMessageBox.information(self, "Complete", msg)
